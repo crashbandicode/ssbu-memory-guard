@@ -1,0 +1,38 @@
+[package]
+name = "memory_guard"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Skyline plugin for Super Smash Bros. Ultimate 13.0.5 that repairs pointers with one stray bit at known crash sites and records the page-release failure behind a startup abort"
+license = "MIT"
+
+[package.metadata.skyline]
+titleid = "01006A800016E000"
+
+[features]
+# Eden-only diagnostics (hit counts per site, planted faults, a forced page-release failure);
+# never in the shipped NRO.
+diag = []
+
+[lib]
+# cdylib only: Cargo skips LTO for a library that is also an rlib, and the
+# unit tests do not need one.
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "switch")'.dependencies]
+skyline = "=0.6.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# Size over speed: the mapped NRO is the game-heap cost (as in the other plugins).
+opt-level = "s"
+debug = 2
+strip = false
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("switch"))'] }

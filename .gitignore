@@ -1,0 +1,12 @@
+target/
+/dist/
+*.nro
+*.nso
+*.elf
+*.zip
+*.log
+*.dmp
+__pycache__/
+# local notes and Eden captures
+work/
+HANDOFF.md
