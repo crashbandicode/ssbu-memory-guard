@@ -7,23 +7,22 @@ import hashlib
 import sys
 
 OFFSETS = {
-    # hooked sites
-    "DISPATCH_LIST": 0x3816814,
-    "COMPONENT_GET": 0x3810C,
-    "LIST_HEAD": 0x37783B4,
-    "LIST_NEXT": 0x37783C0,
-    "FIELD_A8": 0x59864,
-    "REHASH_HEAD": 0x3917574,
-    "REHASH_NEXT": 0x39175A0,
-    "FREE_PAGES_ABORT": 0x37CAEEC,
-    "FREE_PAGES_RESULT": 0x37CAE24,
-    # relied-on windows (the loads and calls the repairs depend on)
+    # hooked sites: every one a plain (not PC-relative) instruction
+    "DISPATCH_LIST": 0x3816814,      # cmp x26, x27
+    "COMPONENT_GET": 0x3810C,        # ldr x0, [x0, x8]
+    "LIST_HEAD": 0x37783B0,          # ldr x8, [x21, #0x8]
+    "LIST_NEXT": 0x37783BC,          # ldr x8, [x8]
+    "FIELD_A8": 0x59860,             # ldr x8, [x0, #0xa8]
+    "REHASH_HEAD": 0x391756C,        # ldr x9, [x11, x12]
+    "REHASH_NEXT": 0x391758C,        # ldr x13, [x9, #0x10]
+    "ABORT_STUB": 0x39C2654,         # ldr x17, [x16, #0x208] in abort's import stub
+    "FREE_PAGES_FORCE": 0x37CAE1C,   # mov x1, x21 (diag only)
+    # relied-on windows
     "DISPATCH_LIST_RELIED": 0x38167E8,
     "COMPONENT_GET_RELIED": 0x38100,
-    "LIST_RELIED": 0x37783B0,
-    "FIELD_A8_RELIED": 0x59860,
-    "REHASH_RELIED": 0x391756C,
-    "FREE_PAGES_RELIED": 0x37CAE10,
+    "ABORT_STUB_RELIED": 0x39C2650,  # the stub from its adrp
+    "ABORT_CALL_RELIED": 0x37CAEEC,  # bl abort after the refused release
+    "FREE_PAGES_RELIED": 0x37CAE10,  # mov w8, w21; lsl x21, x8, #16; mov x0, x20; mov x1, x21; bl FreeMemoryPages
 }
 
 

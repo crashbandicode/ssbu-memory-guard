@@ -4,7 +4,8 @@
 //! to `events.log`. Hooks allocate nothing and write no file; they hand a few
 //! words to the writer through a fixed ring. Only two hook paths wait for the
 //! writer, both just before the game faults or aborts anyway: an `unfixable`
-//! value (so the line reaches the card first) and the refused page release.
+//! value (so the line reaches the card first) and `abort` (the refused page
+//! release, or any other caller).
 
 use crate::chain::{self, hook::Outcome, Entry};
 use crate::model::{self, Action, Block, FreeFailure, Verdict, SITES};
@@ -126,6 +127,9 @@ fn classify(value: u64) -> Verdict {
 // ---------------------------------------------------------------- events
 
 const EVENT_SLOTS: usize = 32;
+/// `abort` called from elsewhere (`value` the return address or its offset in
+/// `.text`, `to` 1 when it is an offset).
+const CODE_ABORT: u64 = 8;
 /// Diag-only event: a planted stray bit (`to` is the planted value).
 const CODE_INJECTED: u64 = 9;
 
@@ -293,6 +297,9 @@ mod diag {
     pub static INJECT_SITE: AtomicUsize = AtomicUsize::new(usize::MAX);
     pub static INJECT_EMPTY: AtomicBool = AtomicBool::new(false);
     pub static INJECT_BIT: AtomicU64 = AtomicU64::new(42);
+    pub static INJECT_AFTER: AtomicU64 = AtomicU64::new(0);
+    /// Eligible calls seen at the inject site (planting waits for `INJECT_AFTER`).
+    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
     pub static INJECTED: AtomicBool = AtomicBool::new(false);
     pub static REPAIR_OFF: AtomicBool = AtomicBool::new(false);
     pub static FORCE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -325,6 +332,7 @@ mod diag {
         }
         INJECT_EMPTY.store(settings.inject_empty, Ordering::Release);
         INJECT_BIT.store(u64::from(settings.inject_bit), Ordering::Release);
+        INJECT_AFTER.store(settings.inject_after, Ordering::Release);
         REPAIR_OFF.store(settings.repair_off, Ordering::Release);
         if let Some(at) = settings.force_free_failure {
             FORCE_AT.store(at, Ordering::Release);
@@ -346,23 +354,24 @@ mod diag {
         } else {
             value != 0 && !model::suspicious(value)
         };
-        if !fits || INJECTED.swap(true, Ordering::AcqRel) {
+        if !fits || ELIGIBLE.fetch_add(1, Ordering::AcqRel) < INJECT_AFTER.load(Ordering::Acquire) {
+            return None;
+        }
+        if INJECTED.swap(true, Ordering::AcqRel) {
             return None;
         }
         push_event(site, CODE_INJECTED, value, value | bit, 0);
         Some(value | bit)
     }
 
-    /// The forced failure: the release that makes `FORCE_AT` turns its result
-    /// into `InvalidCurrentMemory` (2001-0106).
-    pub unsafe fn free_result(ctx: &mut InlineCtx) {
+    /// The forced refusal, just before the release call (`x0` already the
+    /// address): the release that makes `FORCE_AT` asks to free address 0,
+    /// which the kernel refuses, so the game takes its own abort path.
+    pub unsafe fn force_release(ctx: &mut InlineCtx) {
         let at = FORCE_AT.load(Ordering::Acquire);
-        if at == u64::MAX || ctx.registers[0].w() != 0 {
-            return;
-        }
-        if RELEASES.fetch_add(1, Ordering::AcqRel) + 1 == at {
+        if at != u64::MAX && RELEASES.fetch_add(1, Ordering::AcqRel) + 1 == at {
             FORCED.store(true, Ordering::Release);
-            ctx.registers[0].set_x(0xd401);
+            ctx.registers[0].set_x(0);
         }
     }
 }
@@ -451,10 +460,11 @@ unsafe fn pointer_list(site: usize, ctx: &mut InlineCtx, begin: u8, end: u8) {
     }
 }
 
-unsafe fn load_slot(site: usize, ctx: &mut InlineCtx, base: u8, offset: u8) {
+unsafe fn load_slot(site: usize, ctx: &mut InlineCtx, base: u8, index: Option<u8>, offset: u16) {
+    let index = index.map_or(0, |index| ctx.registers[index as usize].x());
     let slot = slot_of(
         ctx.registers[base as usize].x(),
-        ctx.registers[offset as usize].x(),
+        index.wrapping_add(u64::from(offset)),
     );
     if slot == 0 || !slot.is_multiple_of(8) {
         return;
@@ -474,37 +484,26 @@ unsafe fn load_slot(site: usize, ctx: &mut InlineCtx, base: u8, offset: u8) {
     }
 }
 
-unsafe fn loaded(
-    site: usize,
-    ctx: &mut InlineCtx,
-    reg: u8,
-    slot: Option<(u8, u16)>,
-    copy: Option<u8>,
-) {
-    let slot = slot.map_or(0, |(base, offset)| {
-        slot_of(ctx.registers[base as usize].x(), u64::from(offset))
-    });
-    #[cfg(feature = "diag")]
-    if diag::should_inject(site) {
-        if let Some(planted) = diag::planted(site, ctx.registers[reg as usize].x()) {
-            let old = ctx.registers[reg as usize].x();
-            ctx.registers[reg as usize].set_x(planted);
-            if let Some(copy) = copy {
-                ctx.registers[copy as usize].set_x(planted);
-            }
-            swap_slot(slot, old, planted);
-        }
-    }
-    let value = ctx.registers[reg as usize].x();
-    if !model::suspicious(value) {
-        return;
-    }
-    if let Some(to) = judge(site, value, slot, true) {
-        ctx.registers[reg as usize].set_x(to);
-        if let Some(copy) = copy {
-            ctx.registers[copy as usize].set_x(to);
-        }
-        swap_slot(slot, value, to);
+/// The game's `.text` (set in `main`), to read return addresses as offsets.
+static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
+static TEXT_END: AtomicU64 = AtomicU64::new(0);
+
+/// `abort` was called: from the refused release, the record; from anywhere
+/// else, where from. Either way the abort goes on after the writer has it.
+unsafe fn abort_stub(site: usize, ctx: &mut InlineCtx) {
+    let caller = ctx.registers[30].x();
+    let base = TEXT_BASE.load(Ordering::Acquire);
+    let in_main = (base..TEXT_END.load(Ordering::Acquire)).contains(&caller);
+    if in_main && caller - base == model::ABORT_AFTER_RELEASE as u64 {
+        record_free_failure(
+            ctx.registers[0].w(),
+            ctx.registers[20].x(),
+            ctx.registers[21].x(),
+        );
+    } else {
+        let at = if in_main { caller - base } else { caller };
+        let seq = push_event(site, CODE_ABORT, at, u64::from(in_main), 0);
+        wait_written(seq, 300);
     }
 }
 
@@ -513,16 +512,15 @@ unsafe fn on_site(site: usize, ctx: &mut InlineCtx) {
     diag::HITS[site].fetch_add(1, Ordering::Relaxed);
     match SITES[site].action {
         Action::PointerList { begin, end } => pointer_list(site, ctx, begin, end),
-        Action::LoadSlot { base, offset } => load_slot(site, ctx, base, offset),
-        Action::Loaded { reg, slot, copy } => loaded(site, ctx, reg, slot, copy),
-        Action::FreePagesAbort => record_free_failure(
-            ctx.registers[0].w(),
-            ctx.registers[20].x(),
-            ctx.registers[21].x(),
-        ),
-        Action::FreePagesResult => {
+        Action::LoadSlot {
+            base,
+            index,
+            offset,
+        } => load_slot(site, ctx, base, index, offset),
+        Action::AbortStub => abort_stub(site, ctx),
+        Action::ForceRelease => {
             #[cfg(feature = "diag")]
-            diag::free_result(ctx);
+            diag::force_release(ctx);
         }
     }
 }
@@ -650,7 +648,9 @@ fn drain_events() {
             e.slot.load(Ordering::Relaxed),
         );
         let mut line = Line::<256>::new();
-        if code == CODE_INJECTED {
+        if code == CODE_ABORT {
+            let _ = model::abort_line(&mut line, e.tick.load(Ordering::Relaxed), value, to == 1);
+        } else if code == CODE_INJECTED {
             let name = SITES.get(site).map_or("?", |s| s.name);
             let _ = writeln!(
                 line,
@@ -763,25 +763,23 @@ enum Check {
     Off,
 }
 
-/// Reads a site and its relied-on window, before anything is written.
+/// Reads a site and its relied-on windows, before anything is written.
 unsafe fn check(site: &model::Site) -> Check {
-    let (Some(address), Some(relied)) =
-        (text_address(site.offset), text_address(site.relied_offset))
-    else {
+    let Some(address) = text_address(site.offset) else {
         return Check::Site;
     };
     let words = chain::hook::words_at::<{ chain::WORDS }>(address);
     if chain::entry(&site.stock(), &words, address) == Entry::Foreign {
         return Check::Site;
     }
-    let relied_words = chain::hook::words_at::<{ chain::WORDS }>(relied);
-    if !chain::usable(
-        &site.relied_stock(),
-        &relied_words,
-        relied,
-        site.relied_kept,
-    ) {
-        return Check::Relied;
+    for relied in site.relied {
+        let Some(at) = text_address(relied.offset) else {
+            return Check::Relied;
+        };
+        let relied_words = chain::hook::words_at::<{ chain::WORDS }>(at);
+        if !chain::usable(&relied.stock(), &relied_words, at, relied.kept) {
+            return Check::Relied;
+        }
     }
     Check::Usable
 }
@@ -824,6 +822,10 @@ pub fn main() {
         report_install(&mut report);
         return;
     }
+    unsafe {
+        TEXT_BASE.store(getRegionAddress(Region::Text) as u64, Ordering::Release);
+        TEXT_END.store(getRegionAddress(Region::Rodata) as u64, Ordering::Release);
+    }
     #[cfg(feature = "diag")]
     let settings = {
         let settings = diag::load_settings();
@@ -840,6 +842,9 @@ pub fn main() {
                 },
                 settings.inject_bit
             );
+            if settings.inject_after != 0 {
+                let _ = write!(report, " inject_after={}", settings.inject_after);
+            }
         }
         if settings.repair_off {
             let _ = write!(report, " repair=off");
@@ -878,9 +883,11 @@ pub fn main() {
             }
             Check::Usable => {
                 wanted += 1;
+                // One-word hooks only: a far jump would carry the
+                // PC-relative instructions after the site into a trampoline.
                 let (entry, outcome) = match unsafe { text_address(site.offset) } {
                     Some(address) => unsafe {
-                        chain::hook::inline(address, &site.stock(), CALLBACKS[i], i, site.near_only)
+                        chain::hook::inline(address, &site.stock(), CALLBACKS[i], i, true)
                     },
                     None => (Entry::Foreign, Outcome::Skipped),
                 };

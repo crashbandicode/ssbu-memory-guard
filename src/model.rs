@@ -13,9 +13,11 @@
 //! | `field_a8` | 2026-10-06 12:37, MainThread | empty, with bit 25 |
 //! | `rehash_head`, `rehash_next` | 2026-10-23 15:24, TaskWorker2 | empty, with bit 28 |
 //!
-//! In every case the game had just checked the pointer for empty, or was
-//! about to read through it, and faulted. The rule here changes only such a
-//! value, and only to what it was before the bit appeared:
+//! In every case the game was about to read through the pointer (after an
+//! "is it empty?" check the stray bit passed) and faulted. Each hook sits on
+//! the instruction that loads the pointer and checks the memory it loads from
+//! first; the rule changes only a value the game would fault on, and only to
+//! what it was before the bit appeared:
 //!
 //! - one bit above the 39-bit address space over a mapped address: that
 //!   address (the bit cleared);
@@ -26,11 +28,17 @@
 //! Anything else is left as it is. A value the game can read through is never
 //! changed.
 //!
-//! `free_pages_abort` is the other kind of startup crash: the game's heap page
+//! No hook sits on a PC-relative instruction, and every hook must come out as
+//! a one-word branch: in Eden (q01, 2026-11-02) a taken `cbnz` that Skyline's
+//! inline hook had moved into its trampoline jumped 0x200000 past its target,
+//! and a far jump would move the PC-relative instructions after a site too.
+//!
+//! `abort_stub` covers the other kind of startup crash: the game's heap page
 //! provider (`main+0x37c9600`) gives pages back with `nn::os::FreeMemoryPages`
 //! and calls `abort()` when the kernel refuses (12 reports, 2026-10-13 to
-//! 2026-11-02). The hook there only records the refusal and the state of the
-//! pages, then lets the abort go on.
+//! 2026-11-02). The hook in `abort`'s import stub records the refusal and the
+//! kernel's view of the pages (or, for any other caller, where `abort` was
+//! called from), then lets the abort go on.
 
 use crate::chain;
 use crate::guards;
@@ -46,6 +54,10 @@ pub const LONE_BIT_MIN: u64 = 1 << 16;
 /// Bytes that must be readable at a repaired pointer (the reads the game makes
 /// next stay inside them: `+0x8`, `+0xc`, `+0x10`).
 pub const REPAIR_SPAN: u64 = 0x18;
+
+/// Where `abort` returns to after the refused page release (`bl abort` at
+/// `main+0x37caeec`).
+pub const ABORT_AFTER_RELEASE: usize = 0x37c_aef0;
 
 /// What a value read at a site is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,46 +132,50 @@ pub fn classify(value: u64, mapped: impl Fn(u64) -> bool) -> Verdict {
 /// What a site's hook does with the registers it sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// `x26..x27` is the frame's list of command-buffer pointers (each read at
-    /// `+0x8` next); entries are checked and repaired in place. An entry
-    /// cannot be emptied, so `Empty` counts as `Unfixable` here.
+    /// `x[begin]..x[end]` is the frame's list of command-buffer pointers (each
+    /// read at `+0x8` next); entries are checked and repaired in place. An
+    /// entry cannot be emptied, so `Empty` counts as `Unfixable` here.
     PointerList { begin: u8, end: u8 },
-    /// Before `ldr x0, [base, offset]`: the slot is checked, and repaired in
-    /// place, before the game loads it.
-    LoadSlot { base: u8, offset: u8 },
-    /// After a pointer load: `reg` holds the value; `slot` (`base` register,
-    /// byte offset) still holds it in memory; `copy` is a second register the
-    /// game already copied it to.
-    Loaded {
-        reg: u8,
-        slot: Option<(u8, u16)>,
-        copy: Option<u8>,
+    /// The hooked instruction loads a pointer from `x[base] + x[index] +
+    /// offset`: that slot is checked, and repaired in place, before the load.
+    LoadSlot {
+        base: u8,
+        index: Option<u8>,
+        offset: u16,
     },
-    /// `bl abort` after `FreeMemoryPages` failed: `w0` the result, `x20` the
-    /// address, `x21` the size. Recorded, then the abort goes on.
-    FreePagesAbort,
-    /// Diag only: the free result check (`cbnz w0`), to force the failure path
-    /// in Eden.
-    FreePagesResult,
+    /// The second instruction of `abort`'s import stub: `x30` says who called.
+    /// From the refused release (`ABORT_AFTER_RELEASE`): `w0` the result,
+    /// `x20` the address, `x21` the size.
+    AbortStub,
+    /// Diag only: just before the release call (`mov x1, x21`, with `x0`
+    /// already the address); the forced refusal passes address 0 instead.
+    ForceRelease,
 }
 
-/// A hooked site and the 64 bytes there in 13.0.5, plus a 64-byte window
-/// holding the instructions the hook relies on (the loads that give a register
-/// its meaning), which must be the 13.0.5 ones up to the site.
+/// A window of instructions a hook relies on: the first `kept` must be
+/// exactly the 13.0.5 ones; after them other plugins' hooks are accepted.
+pub struct Relied {
+    pub offset: usize,
+    pub bytes: [u8; 64],
+    pub kept: usize,
+}
+
+impl Relied {
+    pub fn stock(&self) -> [u32; chain::WORDS] {
+        chain::words(&self.bytes)
+    }
+}
+
+/// A hooked site and the 64 bytes there in 13.0.5, plus the windows of
+/// instructions the hook relies on (the loads and calls that give a register
+/// its meaning).
 pub struct Site {
     pub name: &'static str,
     pub offset: usize,
     pub guard: [u8; 64],
-    pub relied_offset: usize,
-    pub relied: [u8; 64],
-    /// Instructions at the start of the relied-on window that must be exactly
-    /// the 13.0.5 ones; from there on, other plugins' hooks are accepted.
-    pub relied_kept: usize,
+    pub relied: &'static [Relied],
     pub action: Action,
-    /// The words after the site are a branch target: only a one-word hook is
-    /// safe there (a far jump would cover the target).
-    pub near_only: bool,
-    /// Installed only in the diagnostic build.
+    /// Installed only in the diagnostic build (and only when its setting asks).
     pub diag_only: bool,
 }
 
@@ -168,17 +184,29 @@ impl Site {
     pub fn stock(&self) -> [u32; chain::WORDS] {
         chain::words(&self.guard)
     }
-
-    /// The 13.0.5 instructions of the relied-on window.
-    pub fn relied_stock(&self) -> [u32; chain::WORDS] {
-        chain::words(&self.relied)
-    }
-
-    /// Whether the relied-on window holds the site itself.
-    pub fn relied_holds_site(&self) -> bool {
-        (self.relied_offset..self.relied_offset + 64).contains(&self.offset)
-    }
 }
+
+const ABORT_RELIED: [Relied; 3] = [
+    // The stub itself, from its adrp (the site is its second word).
+    Relied {
+        offset: 0x39c_2650,
+        bytes: guards::ABORT_STUB_RELIED,
+        kept: 1,
+    },
+    // `bl abort` after the refused release, so its return address means that.
+    Relied {
+        offset: 0x37c_aeec,
+        bytes: guards::ABORT_CALL_RELIED,
+        kept: 1,
+    },
+    // mov w8, w21; lsl x21, x8, #16; mov x0, x20; mov x1, x21; bl FreeMemoryPages
+    // (x20 the address, x21 the size); the refusal check after it may be hooked.
+    Relied {
+        offset: 0x37c_ae10,
+        bytes: guards::FREE_PAGES_RELIED,
+        kept: 5,
+    },
+];
 
 /// Every site, in install order. Indices are the hook and stub numbers.
 pub const SITES: [Site; 9] = [
@@ -186,119 +214,110 @@ pub const SITES: [Site; 9] = [
         name: "dispatch_list",
         offset: 0x381_6814,
         guard: guards::DISPATCH_LIST,
-        relied_offset: 0x381_67e8,
-        relied: guards::DISPATCH_LIST_RELIED,
-        relied_kept: 11,
+        // ldp x26, x27, [sp, #0x10] ... up to the site.
+        relied: &[Relied {
+            offset: 0x381_67e8,
+            bytes: guards::DISPATCH_LIST_RELIED,
+            kept: 11,
+        }],
         action: Action::PointerList { begin: 26, end: 27 },
-        near_only: false,
         diag_only: false,
     },
     Site {
         name: "component_get",
         offset: 0x3_810c,
         guard: guards::COMPONENT_GET,
-        relied_offset: 0x3_8100,
-        relied: guards::COMPONENT_GET_RELIED,
-        relied_kept: 3,
-        action: Action::LoadSlot { base: 0, offset: 8 },
-        near_only: false,
+        // adrp; add; ldr x8, [x8, w1, uxtw #3]: x8 is the slot's offset.
+        relied: &[Relied {
+            offset: 0x3_8100,
+            bytes: guards::COMPONENT_GET_RELIED,
+            kept: 3,
+        }],
+        action: Action::LoadSlot {
+            base: 0,
+            index: Some(8),
+            offset: 0,
+        },
         diag_only: false,
     },
     Site {
         name: "list_head",
-        offset: 0x377_83b4,
+        offset: 0x377_83b0,
         guard: guards::LIST_HEAD,
-        relied_offset: 0x377_83b0,
-        relied: guards::LIST_RELIED,
-        relied_kept: 1,
-        action: Action::Loaded {
-            reg: 8,
-            slot: Some((21, 8)),
-            copy: None,
+        relied: &[],
+        action: Action::LoadSlot {
+            base: 21,
+            index: None,
+            offset: 8,
         },
-        near_only: true,
         diag_only: false,
     },
     Site {
         name: "list_next",
-        offset: 0x377_83c0,
+        offset: 0x377_83bc,
         guard: guards::LIST_NEXT,
-        relied_offset: 0x377_83b0,
-        relied: guards::LIST_RELIED,
-        relied_kept: 4,
-        action: Action::Loaded {
-            reg: 8,
-            slot: Some((21, 0)),
-            copy: None,
+        relied: &[],
+        action: Action::LoadSlot {
+            base: 8,
+            index: None,
+            offset: 0,
         },
-        near_only: true,
         diag_only: false,
     },
     Site {
         name: "field_a8",
-        offset: 0x5_9864,
+        offset: 0x5_9860,
         guard: guards::FIELD_A8,
-        relied_offset: 0x5_9860,
-        relied: guards::FIELD_A8_RELIED,
-        relied_kept: 1,
-        action: Action::Loaded {
-            reg: 8,
-            slot: Some((0, 0xa8)),
-            copy: None,
+        relied: &[],
+        action: Action::LoadSlot {
+            base: 0,
+            index: None,
+            offset: 0xa8,
         },
-        near_only: false,
         diag_only: false,
     },
     Site {
         name: "rehash_head",
-        offset: 0x391_7574,
+        offset: 0x391_756c,
         guard: guards::REHASH_HEAD,
-        relied_offset: 0x391_756c,
-        relied: guards::REHASH_RELIED,
-        relied_kept: 2,
-        action: Action::Loaded {
-            reg: 9,
-            slot: None,
-            copy: None,
+        relied: &[],
+        action: Action::LoadSlot {
+            base: 11,
+            index: Some(12),
+            offset: 0,
         },
-        near_only: true,
         diag_only: false,
     },
     Site {
         name: "rehash_next",
-        offset: 0x391_75a0,
+        offset: 0x391_758c,
         guard: guards::REHASH_NEXT,
-        relied_offset: 0x391_756c,
-        relied: guards::REHASH_RELIED,
-        relied_kept: 13,
-        action: Action::Loaded {
-            reg: 13,
-            slot: None,
-            copy: Some(9),
+        relied: &[],
+        action: Action::LoadSlot {
+            base: 9,
+            index: None,
+            offset: 0x10,
         },
-        near_only: true,
         diag_only: false,
     },
     Site {
-        name: "free_pages_abort",
-        offset: 0x37c_aeec,
-        guard: guards::FREE_PAGES_ABORT,
-        relied_offset: 0x37c_ae10,
-        relied: guards::FREE_PAGES_RELIED,
-        relied_kept: 5,
-        action: Action::FreePagesAbort,
-        near_only: false,
+        name: "abort_stub",
+        offset: 0x39c_2654,
+        guard: guards::ABORT_STUB,
+        relied: &ABORT_RELIED,
+        action: Action::AbortStub,
         diag_only: false,
     },
     Site {
-        name: "free_pages_result",
-        offset: 0x37c_ae24,
-        guard: guards::FREE_PAGES_RESULT,
-        relied_offset: 0x37c_ae10,
-        relied: guards::FREE_PAGES_RELIED,
-        relied_kept: 5,
-        action: Action::FreePagesResult,
-        near_only: true,
+        name: "free_pages_force",
+        offset: 0x37c_ae1c,
+        guard: guards::FREE_PAGES_FORCE,
+        relied: &[Relied {
+            offset: 0x37c_ae10,
+            bytes: guards::FREE_PAGES_RELIED,
+            kept: 3,
+        }],
+        action: Action::ForceRelease,
         diag_only: true,
     },
 ];
@@ -306,6 +325,18 @@ pub const SITES: [Site; 9] = [
 /// The site table index of a name (diag settings name sites).
 pub fn site_index(name: &[u8]) -> Option<usize> {
     SITES.iter().position(|site| site.name.as_bytes() == name)
+}
+
+/// Whether `word` reads or jumps relative to its own address (B, BL, B.cond,
+/// CBZ/CBNZ, TBZ/TBNZ, ADR/ADRP, LDR literal, PRFM literal): such an
+/// instruction must not be hooked (see the module notes).
+pub const fn pc_relative(word: u32) -> bool {
+    word & 0x7c00_0000 == 0x1400_0000 // B, BL
+        || word & 0xff00_0010 == 0x5400_0000 // B.cond
+        || word & 0x7e00_0000 == 0x3400_0000 // CBZ, CBNZ
+        || word & 0x7e00_0000 == 0x3600_0000 // TBZ, TBNZ
+        || word & 0x1f00_0000 == 0x1000_0000 // ADR, ADRP
+        || word & 0x3b00_0000 == 0x1800_0000 // LDR (literal), LDRSW/PRFM literal
 }
 
 /// A Horizon result as the console shows it: `2000 + module`, then the description.
@@ -339,7 +370,7 @@ pub struct FreeFailure {
     pub used: u64,
     pub blocks: [Block; FREE_BLOCKS],
     pub block_count: usize,
-    /// Set by the diagnostic build's forced failure (Eden); the console never sets it.
+    /// Set by the diagnostic build's forced refusal (Eden); the console never sets it.
     pub forced: bool,
 }
 
@@ -352,9 +383,11 @@ pub struct DiagSettings {
     pub inject_empty: bool,
     /// Which bit to plant.
     pub inject_bit: u32,
+    /// Skip this many eligible calls before planting (to plant after boot).
+    pub inject_after: u64,
     /// `repair=off`: let the planted value through (the control run).
     pub repair_off: bool,
-    /// Make the page release at `free_pages_result` fail once, after this many releases.
+    /// Refuse the release that makes this count (`free_pages_force`).
     pub force_free_failure: Option<u64>,
 }
 
@@ -377,6 +410,7 @@ impl DiagSettings {
                         out.inject_bit = bit as u32;
                     }
                 }
+                b"inject_after" => out.inject_after = parse_u64(value).unwrap_or(0),
                 b"repair" => out.repair_off = value == b"off",
                 b"force_free_failure" => out.force_free_failure = parse_u64(value),
                 _ => {}
@@ -422,6 +456,22 @@ pub fn event_line(
         write!(out, " applied=0")?;
     }
     writeln!(out)
+}
+
+/// `<tick> abort caller=main+<hex>`: `abort` called from somewhere other than
+/// the refused release (`caller` is the return address's offset, or the
+/// address itself when it is outside the game's code).
+pub fn abort_line(
+    out: &mut impl Write,
+    tick: u64,
+    caller: u64,
+    in_main: bool,
+) -> core::fmt::Result {
+    if in_main {
+        writeln!(out, "{tick} abort caller=main+{caller:#x}")
+    } else {
+        writeln!(out, "{tick} abort caller={caller:#x}")
+    }
 }
 
 /// Verdicts as the hooks pass them to the writer thread (one word each).
@@ -554,124 +604,120 @@ mod tests {
         assert_eq!(Verdict::Unfixable.replacement(), None);
     }
 
-    fn word(guard: &[u8; 64], index: usize) -> u32 {
-        chain::words(guard)[index]
+    fn by_name(name: &str) -> &'static Site {
+        &SITES[site_index(name.as_bytes()).unwrap()]
     }
 
-    /// `cbz`/`cbnz` (64-bit) on register `rt`.
-    fn is_cb(word: u32, nonzero: bool, rt: u32) -> bool {
-        word & 0xff00_001f == if nonzero { 0xb500_0000 } else { 0xb400_0000 } | rt
+    /// `ldr Xt, [Xn, #imm]` (64-bit, unsigned offset).
+    const fn ldr_imm(rt: u32, rn: u32, imm: u32) -> u32 {
+        0xf940_0000 | ((imm / 8) << 10) | (rn << 5) | rt
+    }
+
+    /// `ldr Xt, [Xn, Xm]`.
+    const fn ldr_reg(rt: u32, rn: u32, rm: u32) -> u32 {
+        0xf860_6800 | (rm << 16) | (rn << 5) | rt
     }
 
     #[test]
     fn each_site_holds_the_instruction_its_action_expects() {
-        let by_name = |n: &str| SITES.iter().find(|s| s.name == n).unwrap();
+        let site_word = |n: &str| by_name(n).stock()[0];
+        assert_eq!(site_word("dispatch_list"), 0xeb1b_035f, "cmp x26, x27");
         assert_eq!(
-            word(&by_name("dispatch_list").guard, 0),
-            0xeb1b_035f,
-            "cmp x26, x27"
-        );
-        assert_eq!(
-            word(&by_name("dispatch_list").relied, 0),
+            by_name("dispatch_list").relied[0].stock()[0],
             0xa941_6ffa,
             "ldp x26, x27, [sp, #0x10]"
         );
+        assert_eq!(site_word("component_get"), ldr_reg(0, 0, 8));
         assert_eq!(
-            word(&by_name("component_get").guard, 0),
-            0xf868_6800,
-            "ldr x0, [x0, x8]"
+            by_name("component_get").relied[0].stock()[2],
+            0xf861_5908,
+            "ldr x8, [x8, w1, uxtw #3]"
         );
-        assert!(is_cb(word(&by_name("list_head").guard, 0), false, 8));
-        assert_eq!(
-            word(&by_name("list_head").relied, 0),
-            0xf940_06a8,
-            "ldr x8, [x21, #8]"
-        );
-        assert!(is_cb(word(&by_name("list_next").guard, 0), true, 8));
-        assert_eq!(
-            word(&by_name("list_next").relied, 2),
-            0xaa08_03f5,
-            "mov x21, x8"
-        );
-        assert_eq!(
-            word(&by_name("list_next").relied, 3),
-            0xf940_0108,
-            "ldr x8, [x8]"
-        );
-        assert!(is_cb(word(&by_name("field_a8").guard, 0), false, 8));
-        assert_eq!(
-            word(&by_name("field_a8").relied, 0),
-            0xf940_5408,
-            "ldr x8, [x0, #0xa8]"
-        );
-        assert!(is_cb(word(&by_name("rehash_head").guard, 0), false, 9));
-        assert_eq!(
-            word(&by_name("rehash_head").relied, 0),
-            0xf86c_6969,
-            "ldr x9, [x11, x12]"
-        );
-        assert_eq!(
-            word(&by_name("rehash_head").relied, 1),
-            0xf82c_697f,
-            "str xzr, [x11, x12]"
-        );
-        assert!(is_cb(word(&by_name("rehash_next").guard, 0), true, 13));
-        assert_eq!(
-            word(&by_name("rehash_next").relied, 8),
-            0xf940_092d,
-            "ldr x13, [x9, #0x10]"
-        );
-        assert_eq!(
-            word(&by_name("rehash_next").relied, 12),
-            0xaa0d_03e9,
-            "mov x9, x13"
-        );
-        assert_eq!(
-            word(&by_name("free_pages_abort").guard, 0) >> 26,
-            0b100101,
-            "bl abort"
-        );
-        assert_eq!(
-            word(&by_name("free_pages_result").guard, 0) & 0xff00_001f,
-            0x3500_0000,
-            "cbnz w0"
-        );
-        assert_eq!(
-            word(&by_name("free_pages_abort").relied, 1),
-            0xd370_bd15,
-            "lsl x21, x8, #16"
-        );
+        assert_eq!(site_word("list_head"), ldr_imm(8, 21, 8));
+        assert_eq!(site_word("list_next"), ldr_imm(8, 8, 0));
+        assert_eq!(site_word("field_a8"), ldr_imm(8, 0, 0xa8));
+        assert_eq!(site_word("rehash_head"), ldr_reg(9, 11, 12));
+        assert_eq!(site_word("rehash_next"), ldr_imm(13, 9, 0x10));
+        assert_eq!(site_word("abort_stub"), ldr_imm(17, 16, 0x208));
+        assert_eq!(site_word("free_pages_force"), 0xaa15_03e1, "mov x1, x21");
     }
 
     #[test]
-    fn relied_windows_end_where_the_site_starts() {
+    fn load_slot_sites_match_their_load() {
         for site in &SITES {
-            assert!(site.relied_offset <= site.offset, "{}", site.name);
-            assert!(site.relied_kept <= chain::WORDS, "{}", site.name);
-            assert_eq!(site.offset % 4, 0);
-            if site.relied_holds_site() {
-                // Exactly the words before the site are kept; the site's own
-                // word is in both windows.
-                assert_eq!(
-                    site.relied_kept,
-                    (site.offset - site.relied_offset) / 4,
-                    "{}",
-                    site.name
-                );
-                assert_eq!(
-                    site.relied_stock()[site.relied_kept],
-                    site.stock()[0],
-                    "{}",
-                    site.name
-                );
+            let Action::LoadSlot {
+                base,
+                index,
+                offset,
+            } = site.action
+            else {
+                continue;
+            };
+            let expect = match index {
+                Some(index) => {
+                    assert_eq!(offset, 0, "{}", site.name);
+                    ldr_reg(site.stock()[0] & 31, u32::from(base), u32::from(index))
+                }
+                None => ldr_imm(site.stock()[0] & 31, u32::from(base), u32::from(offset)),
+            };
+            assert_eq!(site.stock()[0], expect, "{}", site.name);
+        }
+    }
+
+    #[test]
+    fn no_site_is_a_pc_relative_instruction() {
+        for site in &SITES {
+            assert!(!pc_relative(site.stock()[0]), "{}", site.name);
+        }
+        // The classes it refuses, from the 13.0.5 code this plugin met.
+        for word in [
+            0xb500_00c8u32, // cbnz x8
+            0xb400_0189,    // cbz x9
+            0x5400_0180,    // b.eq
+            0x9407_ddd9,    // bl
+            0x1400_0001,    // b
+            0xd000_c6f0,    // adrp
+            0x3500_0640,    // cbnz w0
+            0x3600_0000,    // tbz
+            0x5800_0051,    // ldr x17, literal
+        ] {
+            assert!(pc_relative(word), "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn the_abort_hook_relies_on_the_release_and_the_call() {
+        let abort = by_name("abort_stub");
+        assert_eq!(abort.relied.len(), 3);
+        assert_eq!(abort.relied[0].stock()[0], 0xd000_c6f0, "adrp x16");
+        assert_eq!(abort.relied[0].stock()[1], abort.stock()[0]);
+        assert_eq!(abort.relied[1].stock()[0] >> 26, 0b100101, "bl abort");
+        // bl at 0x37caeec targets the stub at 0x39c2650.
+        let bl = abort.relied[1].stock()[0];
+        let target = abort.relied[1].offset as i64 + ((((bl << 6) as i32) >> 4) as i64);
+        assert_eq!(target, 0x39c_2650);
+        assert_eq!(ABORT_AFTER_RELEASE, abort.relied[1].offset + 4);
+        let release = &abort.relied[2].stock();
+        assert_eq!(release[0], 0x2a15_03e8, "mov w8, w21");
+        assert_eq!(release[1], 0xd370_bd15, "lsl x21, x8, #16");
+        assert_eq!(release[2], 0xaa14_03e0, "mov x0, x20");
+        assert_eq!(release[3], 0xaa15_03e1, "mov x1, x21");
+        assert_eq!(release[4] >> 26, 0b100101, "bl FreeMemoryPages");
+    }
+
+    #[test]
+    fn relied_windows_keep_only_what_comes_before_a_site() {
+        for site in &SITES {
+            for relied in site.relied {
+                assert!(relied.kept <= chain::WORDS, "{}", site.name);
+                let holds_site = (relied.offset..relied.offset + 64).contains(&site.offset);
+                if holds_site {
+                    let at = (site.offset - relied.offset) / 4;
+                    assert_eq!(relied.kept, at, "{}", site.name);
+                    assert_eq!(relied.stock()[at], site.stock()[0], "{}", site.name);
+                }
             }
         }
-        // The abort site relies on the release call 0xdc bytes before it:
-        // mov w8, w21; lsl x21, x8, #16; mov x0, x20; mov x1, x21; bl FreeMemoryPages.
-        let abort = &SITES[site_index(b"free_pages_abort").unwrap()];
-        assert!(!abort.relied_holds_site());
-        assert_eq!(abort.relied_kept, 5);
-        assert_eq!(abort.relied_stock()[4] >> 26, 0b100101, "bl");
     }
 
     #[test]
@@ -692,11 +738,11 @@ mod tests {
     #[test]
     fn diag_settings() {
         let s = DiagSettings::parse(
-            b"inject=list_next\ninject_mode=empty\ninject_bit=25\nrepair=off\n",
+            b"inject=list_next\ninject_mode=empty\ninject_bit=25\ninject_after=100\nrepair=off\n",
         );
         assert_eq!(s.inject, site_index(b"list_next"));
         assert!(s.inject_empty && s.repair_off);
-        assert_eq!(s.inject_bit, 25);
+        assert_eq!((s.inject_bit, s.inject_after), (25, 100));
         let s = DiagSettings::parse(b" force_free_failure = 40 \r\ninject_bit=3\n");
         assert_eq!(s.force_free_failure, Some(40));
         assert_eq!(s.inject_bit, 42, "bits below 16 are refused");
@@ -739,6 +785,13 @@ mod tests {
         assert_eq!(
             t.0,
             "9 guard site=list_next verdict=empty value=0x20000000000 to=0x0 slot=0x10 applied=0\n"
+        );
+        let mut t = Text(String::new());
+        abort_line(&mut t, 10, 0x37c_aef0, true).unwrap();
+        abort_line(&mut t, 11, 0x12_3456, false).unwrap();
+        assert_eq!(
+            t.0,
+            "10 abort caller=main+0x37caef0\n11 abort caller=0x123456\n"
         );
     }
 
