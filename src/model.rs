@@ -374,18 +374,47 @@ pub struct FreeFailure {
     pub forced: bool,
 }
 
+/// One planted stray bit (diag): on an empty pointer or a real one, which bit,
+/// and how many eligible calls to let pass first (to plant after boot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Injection {
+    pub empty: bool,
+    pub bit: u32,
+    pub after: u64,
+}
+
+impl Injection {
+    /// `mode[:bit[:after]]` after the site name; defaults `pointer`, 42, 0.
+    fn parse(fields: &mut core::slice::Split<'_, u8, impl FnMut(&u8) -> bool>) -> Option<Self> {
+        let mut out = Self {
+            empty: false,
+            bit: 42,
+            after: 0,
+        };
+        if let Some(mode) = fields.next() {
+            out.empty = match mode.trim_ascii() {
+                b"empty" => true,
+                b"pointer" | b"" => false,
+                _ => return None,
+            };
+        }
+        if let Some(bit) = fields.next() {
+            out.bit = parse_u64(bit.trim_ascii()).filter(|b| (16..64).contains(b))? as u32;
+        }
+        if let Some(after) = fields.next() {
+            out.after = parse_u64(after.trim_ascii())?;
+        }
+        Some(out)
+    }
+}
+
 /// Diagnostic settings (`diag.txt`, Eden only).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagSettings {
-    /// Plant a stray bit once at this site.
-    pub inject: Option<usize>,
-    /// Plant it on an empty pointer (`true`) or on a real one (`false`).
-    pub inject_empty: bool,
-    /// Which bit to plant.
-    pub inject_bit: u32,
-    /// Skip this many eligible calls before planting (to plant after boot).
-    pub inject_after: u64,
-    /// `repair=off`: let the planted value through (the control run).
+    /// Per site: plant a stray bit once
+    /// (`inject=<site>[:empty|pointer[:<bit>[:<after>]]],...`).
+    pub inject: [Option<Injection>; SITES.len()],
+    /// `repair=off`: let the planted values through (the control run).
     pub repair_off: bool,
     /// Refuse the release that makes this count (`free_pages_force`).
     pub force_free_failure: Option<u64>,
@@ -393,24 +422,23 @@ pub struct DiagSettings {
 
 impl DiagSettings {
     pub fn parse(text: &[u8]) -> Self {
-        let mut out = Self {
-            inject_bit: 42,
-            ..Self::default()
-        };
+        let mut out = Self::default();
         for line in text.split(|b| *b == b'\n') {
             let Some(eq) = line.iter().position(|b| *b == b'=') else {
                 continue;
             };
             let (key, value) = (line[..eq].trim_ascii(), line[eq + 1..].trim_ascii());
             match key {
-                b"inject" => out.inject = site_index(value),
-                b"inject_mode" => out.inject_empty = value == b"empty",
-                b"inject_bit" => {
-                    if let Some(bit) = parse_u64(value).filter(|b| (16..64).contains(b)) {
-                        out.inject_bit = bit as u32;
+                b"inject" => {
+                    for entry in value.split(|b| *b == b',') {
+                        let mut fields = entry.split(|b| *b == b':');
+                        let Some(site) = fields.next().and_then(|n| site_index(n.trim_ascii()))
+                        else {
+                            continue;
+                        };
+                        out.inject[site] = Injection::parse(&mut fields);
                     }
                 }
-                b"inject_after" => out.inject_after = parse_u64(value).unwrap_or(0),
                 b"repair" => out.repair_off = value == b"off",
                 b"force_free_failure" => out.force_free_failure = parse_u64(value),
                 _ => {}
@@ -738,15 +766,40 @@ mod tests {
     #[test]
     fn diag_settings() {
         let s = DiagSettings::parse(
-            b"inject=list_next\ninject_mode=empty\ninject_bit=25\ninject_after=100\nrepair=off\n",
+            b"inject=dispatch_list, list_next:empty:41:100 ,field_a8:empty:25,rehash_head:bogus\nrepair=off\n",
         );
-        assert_eq!(s.inject, site_index(b"list_next"));
-        assert!(s.inject_empty && s.repair_off);
-        assert_eq!((s.inject_bit, s.inject_after), (25, 100));
-        let s = DiagSettings::parse(b" force_free_failure = 40 \r\ninject_bit=3\n");
+        let at = |n: &[u8]| s.inject[site_index(n).unwrap()];
+        assert_eq!(
+            at(b"dispatch_list"),
+            Some(Injection {
+                empty: false,
+                bit: 42,
+                after: 0
+            })
+        );
+        assert_eq!(
+            at(b"list_next"),
+            Some(Injection {
+                empty: true,
+                bit: 41,
+                after: 100
+            })
+        );
+        assert_eq!(at(b"field_a8").map(|i| (i.empty, i.bit)), Some((true, 25)));
+        assert_eq!(at(b"rehash_head"), None, "unknown mode");
+        assert_eq!(at(b"component_get"), None);
+        assert!(s.repair_off);
+        let s = DiagSettings::parse(b" force_free_failure = 40 \r\ninject=list_head:empty:3\n");
         assert_eq!(s.force_free_failure, Some(40));
-        assert_eq!(s.inject_bit, 42, "bits below 16 are refused");
-        assert_eq!(DiagSettings::parse(b"inject=nope").inject, None);
+        assert_eq!(
+            s.inject[site_index(b"list_head").unwrap()],
+            None,
+            "bits below 16 are refused"
+        );
+        assert!(DiagSettings::parse(b"inject=nope")
+            .inject
+            .iter()
+            .all(Option::is_none));
     }
 
     struct Text(String);

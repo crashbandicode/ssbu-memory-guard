@@ -291,16 +291,23 @@ unsafe fn record_free_failure(result: u32, address: u64, size: u64) {
 #[cfg(feature = "diag")]
 mod diag {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
-    pub static HITS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
-    pub static INJECT_SITE: AtomicUsize = AtomicUsize::new(usize::MAX);
-    pub static INJECT_EMPTY: AtomicBool = AtomicBool::new(false);
-    pub static INJECT_BIT: AtomicU64 = AtomicU64::new(42);
-    pub static INJECT_AFTER: AtomicU64 = AtomicU64::new(0);
-    /// Eligible calls seen at the inject site (planting waits for `INJECT_AFTER`).
-    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
-    pub static INJECTED: AtomicBool = AtomicBool::new(false);
+    const fn flags() -> [AtomicBool; SITE_COUNT] {
+        [const { AtomicBool::new(false) }; SITE_COUNT]
+    }
+    const fn counters() -> [AtomicU64; SITE_COUNT] {
+        [const { AtomicU64::new(0) }; SITE_COUNT]
+    }
+
+    pub static HITS: [AtomicU64; SITE_COUNT] = counters();
+    /// Per site: plant once, on an empty or a real pointer, this bit, after
+    /// this many eligible calls.
+    static INJECT_ON: [AtomicBool; SITE_COUNT] = flags();
+    static INJECT_EMPTY: [AtomicBool; SITE_COUNT] = flags();
+    static INJECT_BIT: [AtomicU64; SITE_COUNT] = counters();
+    static INJECT_AFTER: [AtomicU64; SITE_COUNT] = counters();
+    static ELIGIBLE: [AtomicU64; SITE_COUNT] = counters();
+    static INJECTED: [AtomicBool; SITE_COUNT] = flags();
     pub static REPAIR_OFF: AtomicBool = AtomicBool::new(false);
     pub static FORCE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
     pub static RELEASES: AtomicU64 = AtomicU64::new(0);
@@ -327,12 +334,14 @@ mod diag {
             }
         }
         let settings = model::DiagSettings::parse(&buf[..(read as usize).min(buf.len())]);
-        if let Some(site) = settings.inject {
-            INJECT_SITE.store(site, Ordering::Release);
+        for (site, injection) in settings.inject.iter().enumerate() {
+            if let Some(injection) = injection {
+                INJECT_EMPTY[site].store(injection.empty, Ordering::Release);
+                INJECT_BIT[site].store(u64::from(injection.bit), Ordering::Release);
+                INJECT_AFTER[site].store(injection.after, Ordering::Release);
+                INJECT_ON[site].store(true, Ordering::Release);
+            }
         }
-        INJECT_EMPTY.store(settings.inject_empty, Ordering::Release);
-        INJECT_BIT.store(u64::from(settings.inject_bit), Ordering::Release);
-        INJECT_AFTER.store(settings.inject_after, Ordering::Release);
         REPAIR_OFF.store(settings.repair_off, Ordering::Release);
         if let Some(at) = settings.force_free_failure {
             FORCE_AT.store(at, Ordering::Release);
@@ -340,24 +349,24 @@ mod diag {
         settings
     }
 
-    /// Whether this call should plant the stray bit (once per boot).
+    /// Whether this call should plant the stray bit (once per boot per site).
     pub fn should_inject(site: usize) -> bool {
-        INJECT_SITE.load(Ordering::Acquire) == site && !INJECTED.load(Ordering::Acquire)
+        INJECT_ON[site].load(Ordering::Acquire) && !INJECTED[site].load(Ordering::Acquire)
     }
 
     /// Plants it on `value` when the mode fits; `None` leaves the call alone.
     pub fn planted(site: usize, value: u64) -> Option<u64> {
-        let bit = 1u64 << INJECT_BIT.load(Ordering::Acquire);
-        let empty = INJECT_EMPTY.load(Ordering::Acquire);
-        let fits = if empty {
+        let bit = 1u64 << INJECT_BIT[site].load(Ordering::Acquire);
+        let fits = if INJECT_EMPTY[site].load(Ordering::Acquire) {
             value == 0
         } else {
             value != 0 && !model::suspicious(value)
         };
-        if !fits || ELIGIBLE.fetch_add(1, Ordering::AcqRel) < INJECT_AFTER.load(Ordering::Acquire) {
-            return None;
-        }
-        if INJECTED.swap(true, Ordering::AcqRel) {
+        if !fits
+            || ELIGIBLE[site].fetch_add(1, Ordering::AcqRel)
+                < INJECT_AFTER[site].load(Ordering::Acquire)
+            || INJECTED[site].swap(true, Ordering::AcqRel)
+        {
             return None;
         }
         push_event(site, CODE_INJECTED, value, value | bit, 0);
@@ -830,20 +839,16 @@ pub fn main() {
     let settings = {
         let settings = diag::load_settings();
         let _ = write!(report, " diag=1");
-        if let Some(site) = settings.inject {
-            let _ = write!(
-                report,
-                " inject={}/{}/bit{}",
-                SITES[site].name,
-                if settings.inject_empty {
-                    "empty"
-                } else {
-                    "pointer"
-                },
-                settings.inject_bit
-            );
-            if settings.inject_after != 0 {
-                let _ = write!(report, " inject_after={}", settings.inject_after);
+        for (site, injection) in settings.inject.iter().enumerate() {
+            if let Some(injection) = injection {
+                let _ = write!(
+                    report,
+                    " inject={}/{}/bit{}/after{}",
+                    SITES[site].name,
+                    if injection.empty { "empty" } else { "pointer" },
+                    injection.bit,
+                    injection.after
+                );
             }
         }
         if settings.repair_off {
