@@ -41,8 +41,9 @@ driving P1.*
 **Tested** in Eden on 2026-11-02 ([evidence](docs/EVIDENCE.md)): every site
 installed next to the card's plugins; planted stray bits were repaired at all
 seven sites; with repairs off the same plants made Eden read the addresses the
-console crashed on; a forced page-release refusal was recorded. **Not
-tested** on a Switch.
+console crashed on; a forced page-release refusal was recorded; a LAN Online
+match ended with no desync. Installed on the operator's Switch on 2026-11-02;
+**not yet run** there.
 
 ## Log
 
@@ -60,7 +61,8 @@ tested** on a Switch.
 
 ## Install
 
-Copy `libmemory_guard.nro` to
+[Download 0.1.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.1.0)
+and copy `libmemory_guard.nro` to
 `sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins/`.
 
 ## Build

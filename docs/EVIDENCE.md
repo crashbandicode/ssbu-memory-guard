@@ -63,5 +63,33 @@ Each call goes through Skyline's inline-hook trampoline (all registers saved
 and restored) and a few compares; the cost per call on the console is not
 measured.
 
-**Not tested:** the Switch; online play; a stray bit the game produced by
-itself (every repair above was planted).
+## Eden LAN pair, 2026-11-02 (d02)
+
+One LAN Online Quickplay match (1 stock) between the Surface and the Yoga. The
+Surface ran release `b2de129a` with Online Deluxe 0.10.2 (`bc8a6428…`),
+ssbu-desync-detector `95e7def9…` and the tile cursor; the Yoga ran Online
+Deluxe 0.10.1 (`a8dcda24…`), the same detector and cursor, without this
+plugin.
+
+- The Surface's log held only the install line: all eight sites
+  `stock/near`, `result=installed heap_allocations=0`.
+- Both detectors: `sync_end trigger=normal kind=1 frame=1218 …
+  desync_seen=0`.
+- Neither Eden log had an `Unmapped` line.
+
+## Release and card install, 2026-11-02
+
+- Tag `v0.1.0` (`f0aee45`) built from a clean clone byte-identical to the
+  tested release build (`b2de129a…`, 40,960 bytes).
+- The [Forgejo release](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.1.0)
+  (release 649) carries the NRO, `manifest.json` (`c2f628a7…`,
+  `hardware_tested: false`) and `SHA256SUMS.txt`; each was downloaded without
+  authentication and matched.
+- Added to the operator's card over hekate UMS on the Surface (17:20Z,
+  `installed_verified`, then `verified_in_place`), next to the card's 16
+  plugins (Online Deluxe 0.10.2 among them), which read back unchanged.
+  To remove it, delete `libmemory_guard.nro` from the plugins folder.
+
+**Not tested:** a run on the Switch (installed, not yet booted); online play
+beyond the LAN pair; a stray bit the game produced by itself (every repair
+above was planted).
