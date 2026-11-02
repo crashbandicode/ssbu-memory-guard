@@ -32,14 +32,27 @@ def main():
     print(f"//! (sha256 {hashlib.sha256(image).hexdigest()}): the 64 bytes at each offset.")
     print("//! Do not edit by hand.")
     print()
+    print("/// The 64 bytes at a hooked site.")
+    print("pub struct Guard {")
+    print("    pub guard: [u8; 64],")
+    print("}")
+    print()
     for name, offset in OFFSETS.items():
         data = image[0x100 + offset:0x100 + offset + 64]
         rows = [", ".join(f"0x{b:02x}" for b in data[i:i + 16]) for i in range(0, 64, 16)]
         print(f"/// `main+{offset:#x}`.")
-        print(f"pub const {name}: [u8; 64] = [")
-        for row in rows:
-            print(f"    {row},")
-        print("];")
+        if name.endswith("_RELIED"):
+            print(f"pub const {name}: [u8; 64] = [")
+            for row in rows:
+                print(f"    {row},")
+            print("];")
+        else:
+            print(f"pub const {name}: Guard = Guard {{")
+            print("    guard: [")
+            for row in rows:
+                print(f"        {row},")
+            print("    ],")
+            print("};")
         print()
 
 

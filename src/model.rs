@@ -213,7 +213,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "dispatch_list",
         offset: 0x381_6814,
-        guard: guards::DISPATCH_LIST,
+        guard: guards::DISPATCH_LIST.guard,
         // ldp x26, x27, [sp, #0x10] ... up to the site.
         relied: &[Relied {
             offset: 0x381_67e8,
@@ -226,7 +226,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "component_get",
         offset: 0x3_810c,
-        guard: guards::COMPONENT_GET,
+        guard: guards::COMPONENT_GET.guard,
         // adrp; add; ldr x8, [x8, w1, uxtw #3]: x8 is the slot's offset.
         relied: &[Relied {
             offset: 0x3_8100,
@@ -243,7 +243,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "list_head",
         offset: 0x377_83b0,
-        guard: guards::LIST_HEAD,
+        guard: guards::LIST_HEAD.guard,
         relied: &[],
         action: Action::LoadSlot {
             base: 21,
@@ -255,7 +255,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "list_next",
         offset: 0x377_83bc,
-        guard: guards::LIST_NEXT,
+        guard: guards::LIST_NEXT.guard,
         relied: &[],
         action: Action::LoadSlot {
             base: 8,
@@ -267,7 +267,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "field_a8",
         offset: 0x5_9860,
-        guard: guards::FIELD_A8,
+        guard: guards::FIELD_A8.guard,
         relied: &[],
         action: Action::LoadSlot {
             base: 0,
@@ -279,7 +279,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "rehash_head",
         offset: 0x391_756c,
-        guard: guards::REHASH_HEAD,
+        guard: guards::REHASH_HEAD.guard,
         relied: &[],
         action: Action::LoadSlot {
             base: 11,
@@ -291,7 +291,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "rehash_next",
         offset: 0x391_758c,
-        guard: guards::REHASH_NEXT,
+        guard: guards::REHASH_NEXT.guard,
         relied: &[],
         action: Action::LoadSlot {
             base: 9,
@@ -303,7 +303,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "abort_stub",
         offset: 0x39c_2654,
-        guard: guards::ABORT_STUB,
+        guard: guards::ABORT_STUB.guard,
         relied: &ABORT_RELIED,
         action: Action::AbortStub,
         diag_only: false,
@@ -311,7 +311,7 @@ pub const SITES: [Site; 9] = [
     Site {
         name: "free_pages_force",
         offset: 0x37c_ae1c,
-        guard: guards::FREE_PAGES_FORCE,
+        guard: guards::FREE_PAGES_FORCE.guard,
         relied: &[Relied {
             offset: 0x37c_ae10,
             bytes: guards::FREE_PAGES_RELIED,
