@@ -3,8 +3,9 @@
 ## Why these sites (2026-11-02)
 
 The operator's card held 186 Atmosphère crash reports for Smash; 94 were
-13.0.5. Read over DBI and classified on the host (scripts and copies in the
-work folder, not in this repo):
+13.0.5 (build ID `21450C647B8C5940`). Read over DBI and classified on the
+host (copies in `/home/intpa/ssbu-cpu-pilot-work/switch/crash-reports-smash-20261102/`
+on the Yoga, not in this repo; counts rechecked 2026-11-13):
 
 - One report faulted on a real pointer with one stray bit (2026-11-02 15:02,
   render dispatch, `main+0x381686c`: entry 65 of the frame's command-buffer
@@ -13,11 +14,15 @@ work folder, not in this repo):
   game's own "is it empty?" check passed because of it (2026-10-06 bit 42 and
   bit 25, 2026-10-15 bit 41, 2026-10-23 bit 28). The code at each site was
   read in the 13.0.5 image to confirm the check.
-- Twelve were the game's `abort()` after `nn::os::FreeMemoryPages` failed in
-  the heap page provider (`main+0x37cae20`, all at startup, the latest
-  2026-11-02 15:42).
-- None of the other 77 has a value this plugin could put right (plugin bugs,
-  the game stopping itself, missing objects, memory that was never there).
+- Twelve (2026-10-13 to 2026-10-26) were the game's `abort()` after
+  `nn::os::FreeMemoryPages` failed in the heap page provider (the call at
+  `main+0x37cae20`). A thirteenth, 2026-11-02 15:42, was copied separately
+  after these counts (95 reports and 13 aborts together). The reports share
+  the abort's stack; they do not show that each one happened at startup.
+- The 2026-11-02 classification found no value this rule could put right in
+  the other 77. Its per-cause breakdown, first given here, did not add up on
+  review the same day (`/home/intpa/ssbu-cpu-pilot-work/memory-guard/review-pilot2.md`
+  on the Yoga), so it is left out.
 
 **Approved workaround (2026-11-02):** the operator asked for this plugin.
 The root cause of the stray bits is not known (single bits at positions 25,
@@ -29,13 +34,20 @@ Card scan before choosing the sites (`tools/build/scan-offsets.py` from the
 playbook, the card's 16 NROs as read 2026-11-02, hashes checked): no plugin
 refers to any hooked offset. The Training Modpack's site table names
 `0x37cae24` (its `console_map` probe) but its install line marks it
-`unchecked`, not installed.
+`unchecked`, not installed. Rerun 2026-11-13 over the install's preflight
+copies (`/home/intpa/ssbu-cpu-pilot-install/ums-memory-guard-v010/before/`):
+the same result for the hooked offsets; `0x37cae24` in the Training Modpack;
+and `0x38100` (the start of `component_get`'s relied-on window, not a hooked
+offset) as an unaligned 32-bit constant in `libimgui_smash.nro` and the
+Training Modpack.
 
 ## Eden, 2026-11-02 (the Ally, the card's 16 plugins plus the tile cursor)
 
-Each run boots the card's set with this plugin, goes to Training, runs the CPU
-Pilot hand-over and 40 s with the CPU driving P1 (harness from the
-ssbu-cpu-pilot h02 run).
+Each run was scripted to boot the card's set with this plugin, go to
+Training, run the CPU Pilot hand-over and 40 s with the CPU driving P1
+(harness from the ssbu-cpu-pilot h02 run); q01, q04, q05 and q06 stopped
+before the character select. Copies of every run are in
+`/home/intpa/ssbu-cpu-pilot/eden/runs/q0*/` on the Yoga.
 
 | Run | Build | What | Result |
 | --- | --- | --- | --- |
@@ -60,8 +72,10 @@ Calls per second, `python3 -I tools/hits.py <events.log>` over q02 and q03
 | `rehash_head`, `rehash_next` | 23–114 | 383–3,201 |
 
 Each call goes through Skyline's inline-hook trampoline (all registers saved
-and restored) and a few compares; the cost per call on the console is not
-measured.
+and restored) and the checks: one value at most sites, every entry of the
+list at `dispatch_list`. The cost per call on the console is not measured.
+Rechecked 2026-11-13: `tools/hits.py` over the q02 and q03 logs gives these
+numbers.
 
 ## Eden LAN pair, 2026-11-02 (d02)
 
@@ -90,6 +104,16 @@ plugin.
   plugins (Online Deluxe 0.10.2 among them), which read back unchanged.
   To remove it, delete `libmemory_guard.nro` from the plugins folder.
 
-**Not tested:** a run on the Switch (installed, not yet booted); online play
-beyond the LAN pair; a stray bit the game produced by itself (every repair
-above was planted).
+## On the Switch (added 2026-11-13)
+
+- 2026-11-03 12:20Z, a read of the card over DBI MTP
+  (`/home/intpa/ssbu-cpu-pilot-install/diagnostic-20261103-1220/ultimate__memory-guard__events.log`):
+  one console boot's install line, all eight sites `stock/near`,
+  `result=installed heap_allocations=0`; no `guard`, `free_pages_refused` or
+  `abort` line.
+- 2026-11-12: `libmemory_guard.nro` on the card is still `b2de129a…`
+  (readback in `/home/intpa/smash-training-lobby/artifacts/card-install-detector-0.5.1/verify.json`).
+
+**Not tested:** a repair or refusal on the Switch; online play beyond the LAN
+pair; a stray bit the game produced by itself (every repair above was
+planted); another plugin's hook on one of the sites (the chain path).
