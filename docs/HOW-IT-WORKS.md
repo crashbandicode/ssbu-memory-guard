@@ -56,8 +56,10 @@ diagnostic build adds `free_pages_force` `0x37cae1c`.
   writer. This needs the commit's instructions to be 13.0.5's
   (`model::ALLOC_PAGES_RELIED`, read at install: `alloc_pages=known`); when
   they differ, the abort is logged by return address only
-  (`alloc_pages=relied/skipped`). Host tests only so far: no Eden run forces
-  this refusal.
+  (`alloc_pages=relied/skipped`). Eden 2026-11-13 (`mg020-diag-1`): the
+  diag build's `force_commit_failure` refused one commit on purpose, and the
+  line came out with the real address and size (docs/EVIDENCE.md). Not seen
+  on the Switch yet.
 - **Logging:** hooks hand a few words to a writer thread through a fixed
   ring of 32 slots; only that thread writes the file.
 

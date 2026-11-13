@@ -104,6 +104,45 @@ plugin.
   plugins (Online Deluxe 0.10.2 among them), which read back unchanged.
   To remove it, delete `libmemory_guard.nro` from the plugins folder.
 
+## Eden, 2026-11-13: 0.2.0's refused page commit (the Yoga, mg020)
+
+Two boots on the Yoga, one Eden each.
+
+- **Set:** integration's `hang-card-r5` set from the 2026-11-13 console hang: the card's 20 plugins (TrainingRooms
+  rc.11 `e9e18b00`, Online Deluxe 0.10.5 `c37ee0ff`, ARCropolis `ac3e05a3`, …), the tile cursor and the card's
+  TrainingRooms and plugin files. Only this plugin was swapped.
+- **Eden:** `2f315fc4…`. Volume 0. The GDB stub was on before `game.load` (ports 6562 and 6563).
+- **Path:** Training, P1 Steve against the CPU.
+- **Records:** `smash-training-lobby/artifacts/console-hang-20261113/worker-b2/` (receipts, the logs and frames).
+
+| Boot | Build | Setup | Result |
+| --- | --- | --- | --- |
+| `mg020-diag-1` | diag `e2a58463` (`924caff`) | `diag.txt` = `force_commit_failure=1`; `force-commit.now` created in Training | The install line ended `alloc_pages_force=stock/near alloc_pages=known result=installed`, with `force_commit_failure=1`. Training loaded and ran for 60 s with no `alloc_pages_refused` line. By then `alloc_pages_force` had counted 3,336 commits since boot, and none was refused. Within 1 s of the trigger file, `diag force_commit armed at=1` appeared. 0.31 s later came exactly one refused line (below). The game stopped there with `abort_stub=1` and 0 FPS. The GDB stop was in `nnSdk`. |
+| `mg020-rel-1` | release `203ffd6f` (`924caff`) | no `diag.txt` | Training was reached and settled for 60 s. The log held one line, the install line: all eight sites `stock/near`, `alloc_pages=known result=installed heap_allocations=0`. There was no `alloc_pages_refused` line and no diag text. |
+
+The refused line from `mg020-diag-1`:
+
+```text
+360908116478 alloc_pages_refused caller=main+0x37ca68c result=0xe03 (2003-0007) address=0x1226680000 size=0x70000 total=0xcd500000 used=0xaffab000 slab_total=0x1000000 slab_used=0x58000 forced=1
+```
+
+**Reading the values:**
+
+- **`size`:** `0x70000`, i.e. 7 × 64 KiB. This confirms that `x19` already holds bytes.
+- **`used` ≤ `total`:** 2.75 of 3.21 GiB.
+- **`slab_used` ≤ `slab_total`:** 352 KiB of 16 MiB.
+- **`address`:** the hook replaces only the call's `x0`, so `x21` keeps the address the game asked for. The stub's
+  `get mappings`, read after the abort (`gdb-info.json`), places it:
+  - it is the first page of the free range that starts right after the provider's last committed `Normal` block
+    (`0x1226650000-0x122667ffff`);
+  - it lies inside the process's Alias region (`0x1108c00000-0x2108bfffff`), where the provider's reserved range and
+    every committed block sit;
+  - it is not inside the `svcSetHeapSize` Heap region.
+- **`result`:** `0xe03` is the result `nn::os::AllocateMemoryPages` returned when asked for address 0. A real refusal
+  on the console may carry another code.
+
+**Not tested:** a refusal the game hit by itself, and any refusal on the Switch.
+
 ## On the Switch (added 2026-11-13)
 
 - 2026-11-03 12:20Z, a read of the card over DBI MTP
