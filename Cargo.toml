@@ -1,6 +1,6 @@
 [package]
 name = "memory_guard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "Skyline plugin for Super Smash Bros. Ultimate 13.0.5 that repairs pointers with one stray bit at known crash sites and records the page-release failure behind a startup abort"

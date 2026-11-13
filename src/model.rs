@@ -38,7 +38,11 @@
 //! and calls `abort()` when the kernel refuses (12 reports, 2026-10-13 to
 //! 2026-11-02). The hook in `abort`'s import stub records the refusal and the
 //! kernel's view of the pages (or, for any other caller, where `abort` was
-//! called from), then lets the abort go on.
+//! called from), then lets the abort go on. The same provider aborts when the
+//! kernel refuses to commit pages (`nn::os::AllocateMemoryPages`, the abort
+//! with caller `main+0x37ca68c`, console 2026-11-13): from there it records
+//! the result, the address and size, and the process's memory and system
+//! resource (page tables and blocks) figures, `svcGetInfo` 6/7 and 16/17.
 
 use crate::chain;
 use crate::guards;
@@ -58,6 +62,22 @@ pub const REPAIR_SPAN: u64 = 0x18;
 /// Where `abort` returns to after the refused page release (`bl abort` at
 /// `main+0x37caeec`).
 pub const ABORT_AFTER_RELEASE: usize = 0x37c_aef0;
+
+/// Where `abort` returns to after the refused page commit (`bl abort` at
+/// `main+0x37ca688`): the same provider's `AllocateMemoryPages` call, which
+/// branches there with the result still in `w0`, `x21` the address and `x19`
+/// the size in bytes (shifted by `lsl x19, x8, #16` before the call).
+pub const ABORT_AFTER_COMMIT: usize = 0x37c_a68c;
+
+/// The commit's instructions the commit record relies on, up to and including
+/// its `bl abort` (word 13): `mov w8, w19; lsl x19, x8, #16; mov x0, x21;
+/// mov x1, x19; bl AllocateMemoryPages; cbnz w0, <bl abort>; ...`. When they
+/// differ, an abort from there is logged as any other caller.
+pub const ALLOC_PAGES_RELIED: Relied = Relied {
+    offset: 0x37c_a654,
+    bytes: guards::ALLOC_PAGES_RELIED,
+    kept: 14,
+};
 
 /// What a value read at a site is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,6 +392,56 @@ pub struct FreeFailure {
     pub block_count: usize,
     /// Set by the diagnostic build's forced refusal (Eden); the console never sets it.
     pub forced: bool,
+}
+
+/// What the plugin knows when the kernel refused to commit pages to the game's
+/// heap (`AllocateMemoryPages`, caller `ABORT_AFTER_COMMIT`). Every value is
+/// read in the hook without allocating or locking: registers and `svcGetInfo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitFailure {
+    pub result: u32,
+    pub address: u64,
+    pub size: u64,
+    /// Process memory, `svcGetInfo` 6 (total) and 7 (used); `u64::MAX` when unread.
+    pub total: u64,
+    pub used: u64,
+    /// The process's system resource (page tables and memory blocks),
+    /// `svcGetInfo` 16 (total) and 17 (used); `u64::MAX` when unread.
+    pub slab_total: u64,
+    pub slab_used: u64,
+}
+
+impl CommitFailure {
+    pub const EMPTY: Self = Self {
+        result: 0,
+        address: 0,
+        size: 0,
+        total: u64::MAX,
+        used: u64::MAX,
+        slab_total: u64::MAX,
+        slab_used: u64::MAX,
+    };
+}
+
+/// The refused commit: one line.
+pub fn commit_line(out: &mut impl Write, tick: u64, failure: &CommitFailure) -> core::fmt::Result {
+    let (module, description) = result_code(failure.result);
+    write!(
+        out,
+        "{tick} alloc_pages_refused caller=main+{ABORT_AFTER_COMMIT:#x} result={:#x} ({module}-{description:04}) address={:#x} size={:#x}",
+        failure.result, failure.address, failure.size
+    )?;
+    if failure.total != u64::MAX && failure.used != u64::MAX {
+        write!(out, " total={:#x} used={:#x}", failure.total, failure.used)?;
+    }
+    if failure.slab_total != u64::MAX && failure.slab_used != u64::MAX {
+        write!(
+            out,
+            " slab_total={:#x} slab_used={:#x}",
+            failure.slab_total, failure.slab_used
+        )?;
+    }
+    writeln!(out)
 }
 
 /// One planted stray bit (diag): on an empty pointer or a real one, which bit,
@@ -887,6 +957,68 @@ mod tests {
             t.0,
             "9 free_pages_refused result=0xd401 (2001-0106) address=0x1180000000 size=0x50000 total=0xcd500000 used=0xc0000000\n\
              9 free_pages_block i=0 address=0x1180000000 size=0x100000 state=0x5 attributes=0xc permission=0x3 ipc_references=0 device_references=1\n"
+        );
+    }
+
+    /// A BL's target from its address and word.
+    fn bl_target(at: usize, word: u32) -> i64 {
+        at as i64 + ((((word << 6) as i32) >> 4) as i64)
+    }
+
+    #[test]
+    fn the_commit_record_relies_on_the_commit_and_its_abort() {
+        let words = ALLOC_PAGES_RELIED.stock();
+        let at = |i: usize| ALLOC_PAGES_RELIED.offset + 4 * i;
+        assert_eq!(words[0], 0x2a13_03e8, "mov w8, w19");
+        assert_eq!(
+            words[1], 0xd370_bd13,
+            "lsl x19, x8, #16: x19 is the size in bytes"
+        );
+        assert_eq!(words[2], 0xaa15_03e0, "mov x0, x21: x21 is the address");
+        assert_eq!(words[3], 0xaa13_03e1, "mov x1, x19");
+        assert_eq!(words[4] >> 26, 0b100101, "bl AllocateMemoryPages");
+        assert_eq!(bl_target(at(4), words[4]), 0x39c_7fa0);
+        // cbnz w0 straight to the bl abort: w0 still holds the result there.
+        assert_eq!(words[5] & 0xff00_001f, 0x3500_0000, "cbnz w0");
+        let cbnz_target =
+            at(5) as i64 + (((((words[5] >> 5) & 0x7ffff) << 13) as i32 >> 11) as i64);
+        assert_eq!(cbnz_target, at(13) as i64);
+        assert_eq!(words[13] >> 26, 0b100101, "bl abort");
+        assert_eq!(bl_target(at(13), words[13]), 0x39c_2650);
+        assert_eq!(ABORT_AFTER_COMMIT, at(13) + 4);
+        assert_eq!(ALLOC_PAGES_RELIED.kept, 14);
+    }
+
+    #[test]
+    fn commit_line_text() {
+        let failure = CommitFailure {
+            result: 0xca01,
+            address: 0x12_3456_0000,
+            size: 0x3_0000,
+            total: 0xcd50_0000,
+            used: 0x9c00_0000,
+            slab_total: 0x100_0000,
+            slab_used: 0xff_f000,
+        };
+        let mut t = Text(String::new());
+        commit_line(&mut t, 12, &failure).unwrap();
+        assert_eq!(
+            t.0,
+            "12 alloc_pages_refused caller=main+0x37ca68c result=0xca01 (2001-0101) address=0x1234560000 size=0x30000 total=0xcd500000 used=0x9c000000 slab_total=0x1000000 slab_used=0xfff000\n"
+        );
+        let mut t = Text(String::new());
+        commit_line(
+            &mut t,
+            13,
+            &CommitFailure {
+                result: 0xd001,
+                ..CommitFailure::EMPTY
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            t.0,
+            "13 alloc_pages_refused caller=main+0x37ca68c result=0xd001 (2001-0104) address=0x0 size=0x0\n"
         );
     }
 }

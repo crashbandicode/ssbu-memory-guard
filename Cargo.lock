@@ -16,7 +16,7 @@ checksum = "1256a11d163c7288d94909f8120ede53294d8c233df314b0e4f01cf0269707da"
 
 [[package]]
 name = "memory_guard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "skyline",
 ]

@@ -1,6 +1,7 @@
 # How it works
 
-2026-11-13, for 0.1.0 (`main` at `fd1b9a6`, the same source as tag `v0.1.0`).
+2026-11-13, for 0.1.0 (`main` at `fd1b9a6`, the same source as tag `v0.1.0`),
+plus the 0.2.0 commit-side record (not released, not on the card).
 Moved here from the README; each point names the code it describes.
 
 ## The rule
@@ -45,13 +46,27 @@ diagnostic build adds `free_pages_force` `0x37cae1c`.
   hook records the result, the range, the process's memory totals and up to
   six blocks the kernel reports, and waits up to 1.5 s for the writer before
   the abort goes on. Any other caller is logged by return address.
+- **Refused page commit (0.2.0):** the same provider calls `abort` (return
+  address `0x37ca68c`) when `nn::os::AllocateMemoryPages` fails; it branches
+  there straight from `cbnz w0`, so `w0` is still the result, `x21` the
+  address and `x19` the size in bytes. The hook records those and
+  `svcGetInfo` 6/7 (process memory) and 16/17 (the system resource: page
+  tables and memory blocks). The game holds the provider's mutex there, so the
+  hook takes no lock and allocates nothing, and waits at most 1.5 s for the
+  writer. This needs the commit's instructions to be 13.0.5's
+  (`model::ALLOC_PAGES_RELIED`, read at install: `alloc_pages=known`); when
+  they differ, the abort is logged by return address only
+  (`alloc_pages=relied/skipped`). Host tests only so far: no Eden run forces
+  this refusal.
 - **Logging:** hooks hand a few words to a writer thread through a fixed
   ring of 32 slots; only that thread writes the file.
 
 ## Log
 
 `sd:/ultimate/memory-guard/events.log` (`model::event_line`,
-`model::free_lines`, `model::abort_line`, `runtime::main`). The
+`model::free_lines`, `model::commit_line`, `model::abort_line`,
+`runtime::main`). From 0.2.0 the install line also carries
+`alloc_pages=known|relied/skipped` before `result=`. The
 `dispatch_list` line below is built from the 2026-11-02 15:02 console crash
 (its value, and entry 65 of the list as the slot); the plugin had not logged
 a repair on the console as of 2026-11-03.
@@ -63,6 +78,7 @@ a repair on the console as of 2026-11-03.
 <tick> guard site=… verdict=unfixable value=…            (the game will fault on it)
 <tick> free_pages_refused result=0x… (<2000+module>-<description>) address=… size=… total=… used=…
 <tick> free_pages_block i=0 address=… size=… state=… attributes=… permission=… ipc_references=… device_references=…
+<tick> alloc_pages_refused caller=main+0x37ca68c result=0x… (<2000+module>-<description>) address=… size=… total=… used=… slab_total=… slab_used=…
 <tick> abort caller=main+0x…
 ```
 

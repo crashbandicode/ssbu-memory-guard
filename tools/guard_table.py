@@ -23,6 +23,8 @@ OFFSETS = {
     "ABORT_STUB_RELIED": 0x39C2650,  # the stub from its adrp
     "ABORT_CALL_RELIED": 0x37CAEEC,  # bl abort after the refused release
     "FREE_PAGES_RELIED": 0x37CAE10,  # mov w8, w21; lsl x21, x8, #16; mov x0, x20; mov x1, x21; bl FreeMemoryPages
+    "ALLOC_PAGES_RELIED": 0x37CA654,  # mov w8, w19; lsl x19, x8, #16; mov x0, x21; mov x1, x19; bl AllocateMemoryPages;
+                                      # cbnz w0 -> ... bl abort at 0x37ca688
 }
 
 

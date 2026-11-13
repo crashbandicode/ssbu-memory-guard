@@ -5,7 +5,7 @@
 //! words to the writer through a fixed ring. Only two hook paths wait for the
 //! writer, both just before the game faults or aborts anyway: an `unfixable`
 //! value (so the line reaches the card first) and `abort` (the refused page
-//! release, or any other caller).
+//! release or page commit, or any other caller).
 
 use crate::chain::{self, hook::Outcome, Entry};
 use crate::model::{self, Action, Block, FreeFailure, Verdict, SITES};
@@ -285,6 +285,54 @@ unsafe fn record_free_failure(result: u32, address: u64, size: u64) {
     }
 }
 
+// ---------------------------------------------------------------- the refused commit
+
+struct CommitRecord(UnsafeCell<model::CommitFailure>);
+// SAFETY: written once by the hook that wins COMMIT_STATE 0 -> 1, read by the
+// writer only after it sees 2.
+unsafe impl Sync for CommitRecord {}
+static COMMIT: CommitRecord = CommitRecord(UnsafeCell::new(model::CommitFailure::EMPTY));
+/// 0 nothing, 1 being written by the hook, 2 ready for the writer, 3 on the card.
+static COMMIT_STATE: AtomicU8 = AtomicU8::new(0);
+static COMMIT_TICK: AtomicU64 = AtomicU64::new(0);
+/// Set at install when the commit's instructions are 13.0.5's (`ALLOC_PAGES_RELIED`).
+static COMMIT_KNOWN: AtomicBool = AtomicBool::new(false);
+
+/// The abort after `AllocateMemoryPages` failed. The game holds its page
+/// provider's mutex here, so this path takes no lock and allocates nothing:
+/// registers and four `svcGetInfo` calls into a static, then (at most 1.5 s)
+/// a wait for the writer, which may itself be stuck behind that mutex.
+unsafe fn record_commit_failure(result: u32, address: u64, size: u64) {
+    if COMMIT_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let record = &mut *COMMIT.0.get();
+    record.result = result;
+    record.address = address;
+    record.size = size;
+    if let (Some(total), Some(used)) = (process_info(6), process_info(7)) {
+        record.total = total;
+        record.used = used;
+    }
+    if let (Some(total), Some(used)) = (process_info(16), process_info(17)) {
+        record.slab_total = total;
+        record.slab_used = used;
+    }
+    COMMIT_TICK.store(tick(), Ordering::Relaxed);
+    COMMIT_STATE.store(2, Ordering::Release);
+    if WRITER_RUNNING.load(Ordering::Acquire) {
+        for _ in 0..150 {
+            if COMMIT_STATE.load(Ordering::Acquire) == 3 {
+                break;
+            }
+            sleep_ms(10);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the hooks
 
 /// Diagnostic build: hits per site, a planted stray bit, the control run.
@@ -509,6 +557,15 @@ unsafe fn abort_stub(site: usize, ctx: &mut InlineCtx) {
             ctx.registers[20].x(),
             ctx.registers[21].x(),
         );
+    } else if in_main
+        && caller - base == model::ABORT_AFTER_COMMIT as u64
+        && COMMIT_KNOWN.load(Ordering::Acquire)
+    {
+        record_commit_failure(
+            ctx.registers[0].w(),
+            ctx.registers[21].x(),
+            ctx.registers[19].x(),
+        );
     } else {
         let at = if in_main { caller - base } else { caller };
         let seq = push_event(site, CODE_ABORT, at, u64::from(in_main), 0);
@@ -693,6 +750,17 @@ fn write_free_failure() {
     FREE_STATE.store(3, Ordering::Release);
 }
 
+fn write_commit_failure() {
+    if COMMIT_STATE.load(Ordering::Acquire) != 2 {
+        return;
+    }
+    let record = unsafe { &*COMMIT.0.get() };
+    let mut line = Line::<384>::new();
+    let _ = model::commit_line(&mut line, COMMIT_TICK.load(Ordering::Relaxed), record);
+    append_log(line.as_bytes());
+    COMMIT_STATE.store(3, Ordering::Release);
+}
+
 extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
     let mut dropped = 0;
     #[cfg(feature = "diag")]
@@ -702,6 +770,7 @@ extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
     loop {
         drain_events();
         write_free_failure();
+        write_commit_failure();
         let now_dropped = EVENT_DROPPED.load(Ordering::Relaxed);
         if now_dropped != dropped {
             dropped = now_dropped;
@@ -873,6 +942,20 @@ pub fn main() {
             Check::Off
         }
     });
+    // The commit record needs the commit's own instructions, also read before
+    // any hook is written; when they differ, that abort is logged by caller only.
+    let commit_known = unsafe {
+        text_address(model::ALLOC_PAGES_RELIED.offset).is_some_and(|at| {
+            let words = chain::hook::words_at::<{ chain::WORDS }>(at);
+            chain::usable(
+                &model::ALLOC_PAGES_RELIED.stock(),
+                &words,
+                at,
+                model::ALLOC_PAGES_RELIED.kept,
+            )
+        })
+    };
+    COMMIT_KNOWN.store(commit_known, Ordering::Release);
     let mut wanted = 0;
     let mut hooked = 0;
     for (i, site) in SITES.iter().enumerate() {
@@ -910,6 +993,15 @@ pub fn main() {
     } else {
         "not_installed"
     };
+    let _ = write!(
+        report,
+        " alloc_pages={}",
+        if commit_known {
+            "known"
+        } else {
+            "relied/skipped"
+        }
+    );
     let _ = write!(report, " result={result}");
     // The install line (and the data folder) first; then the writer, which is
     // the only thing that appends after it.
