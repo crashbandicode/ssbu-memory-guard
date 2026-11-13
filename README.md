@@ -27,16 +27,16 @@ Pilot driving P1.*
   getter and a hash-table rehash.
 - **Refused memory releases:** when the system refuses to take memory back
   and the game aborts, the plugin first writes what the system answered.
-- **Guarded:** it does nothing unless the game is 13.0.5 and the code at
-  each place is the code it expects.
+- **Guarded:** it changes nothing unless the game is 13.0.5, and it leaves
+  alone any place whose code is not the code it expects.
 - **Cost:** 64 KiB of game memory, no heap use.
 
 **Tested** in Eden on 2026-11-02: planted stray bits were repaired at all
 seven places; without the repair, the same plants made the game read the
 addresses two console crashes faulted on; a forced refusal was recorded; a
-LAN Online match ended with no desync. On the operator's Switch since 2026-11-02: a card read on
-2026-11-03 showed it installed at every place, with no repair, refusal or
-abort logged yet. Details: [docs/EVIDENCE.md](docs/EVIDENCE.md); how it
+LAN Online match ended with no desync. On the operator's Switch since
+2026-11-02: a card read on 2026-11-03 showed it installed at every place,
+with no repair, refusal or abort logged yet. Details: [docs/EVIDENCE.md](docs/EVIDENCE.md); how it
 works and what it logs: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 ## Install
