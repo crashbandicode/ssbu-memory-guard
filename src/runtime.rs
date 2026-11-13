@@ -313,6 +313,10 @@ unsafe fn record_commit_failure(result: u32, address: u64, size: u64) {
     record.result = result;
     record.address = address;
     record.size = size;
+    #[cfg(feature = "diag")]
+    {
+        record.forced = diag::FORCED_COMMIT.load(Ordering::Acquire);
+    }
     if let (Some(total), Some(used)) = (process_info(6), process_info(7)) {
         record.total = total;
         record.used = used;
@@ -359,6 +363,11 @@ mod diag {
     pub static REPAIR_OFF: AtomicBool = AtomicBool::new(false);
     pub static FORCE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
     pub static RELEASES: AtomicU64 = AtomicU64::new(0);
+    pub static FORCE_COMMIT_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Set by the writer when `force-commit.now` appears; commits count from then.
+    pub static COMMIT_ARMED: AtomicBool = AtomicBool::new(false);
+    static COMMITS: AtomicU64 = AtomicU64::new(0);
+    pub static FORCED_COMMIT: AtomicBool = AtomicBool::new(false);
 
     const OPEN_READ: i32 = 1;
 
@@ -394,7 +403,57 @@ mod diag {
         if let Some(at) = settings.force_free_failure {
             FORCE_AT.store(at, Ordering::Release);
         }
+        if let Some(at) = settings.force_commit_failure {
+            FORCE_COMMIT_AT.store(at, Ordering::Release);
+        }
         settings
+    }
+
+    /// The forced commit refusal, just before the commit call (`x0` already
+    /// the address): once armed, the commit that makes `FORCE_COMMIT_AT` asks
+    /// for address 0, which the kernel refuses, so the game takes its own abort
+    /// path with its real size and address still in `x19` and `x21`.
+    pub unsafe fn force_commit(ctx: &mut InlineCtx) {
+        let at = FORCE_COMMIT_AT.load(Ordering::Acquire);
+        if at != u64::MAX
+            && COMMIT_ARMED.load(Ordering::Acquire)
+            && COMMITS.fetch_add(1, Ordering::AcqRel) + 1 == at
+        {
+            FORCED_COMMIT.store(true, Ordering::Release);
+            ctx.registers[0].set_x(0);
+        }
+    }
+
+    /// Writer side: arms the forced commit when `force-commit.now` exists.
+    pub fn poll_commit_trigger() {
+        if FORCE_COMMIT_AT.load(Ordering::Acquire) == u64::MAX
+            || COMMIT_ARMED.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let mut file = path(format_args!("{DATA_DIR}/force-commit.now"));
+        let Some(file) = file.with_nul() else {
+            return;
+        };
+        let exists = unsafe {
+            let mut handle = nn::fs::FileHandle { handle: 0 };
+            let ok = nn::fs::OpenFile(&mut handle, file.as_ptr(), OPEN_READ) == 0;
+            if ok {
+                nn::fs::CloseFile(handle);
+            }
+            ok
+        };
+        if exists {
+            COMMIT_ARMED.store(true, Ordering::Release);
+            let mut line = Line::<96>::new();
+            let _ = writeln!(
+                line,
+                "{} diag force_commit armed at={}",
+                tick(),
+                FORCE_COMMIT_AT.load(Ordering::Acquire)
+            );
+            append_log(line.as_bytes());
+        }
     }
 
     /// Whether this call should plant the stray bit (once per boot per site).
@@ -588,6 +647,10 @@ unsafe fn on_site(site: usize, ctx: &mut InlineCtx) {
             #[cfg(feature = "diag")]
             diag::force_release(ctx);
         }
+        Action::ForceCommit => {
+            #[cfg(feature = "diag")]
+            diag::force_commit(ctx);
+        }
     }
 }
 
@@ -610,6 +673,7 @@ callbacks!(
     6 => site_6,
     7 => site_7,
     8 => site_8,
+    9 => site_9,
 );
 
 // ---------------------------------------------------------------- the log
@@ -717,12 +781,9 @@ fn drain_events() {
         if code == CODE_ABORT {
             let _ = model::abort_line(&mut line, e.tick.load(Ordering::Relaxed), value, to == 1);
         } else if code == CODE_INJECTED {
-            let name = SITES.get(site).map_or("?", |s| s.name);
-            let _ = writeln!(
-                line,
-                "{} diag inject site={name} value={value:#x} planted={to:#x}",
-                e.tick.load(Ordering::Relaxed)
-            );
+            // Only the diagnostic build plants values; the release carries no diag text.
+            #[cfg(feature = "diag")]
+            let _ = model::inject_line(&mut line, e.tick.load(Ordering::Relaxed), site, value, to);
         } else {
             let _ = model::event_line(
                 &mut line,
@@ -771,6 +832,8 @@ extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
         drain_events();
         write_free_failure();
         write_commit_failure();
+        #[cfg(feature = "diag")]
+        diag::poll_commit_trigger();
         let now_dropped = EVENT_DROPPED.load(Ordering::Relaxed);
         if now_dropped != dropped {
             dropped = now_dropped;
@@ -926,6 +989,9 @@ pub fn main() {
         if let Some(at) = settings.force_free_failure {
             let _ = write!(report, " force_free_failure={at}");
         }
+        if let Some(at) = settings.force_commit_failure {
+            let _ = write!(report, " force_commit_failure={at}");
+        }
         settings
     };
     // Every site and window is read before the first hook is written: some
@@ -933,7 +999,12 @@ pub fn main() {
     let checks: [Check; SITE_COUNT] = core::array::from_fn(|i| {
         let site = &SITES[i];
         #[cfg(feature = "diag")]
-        let wanted = !site.diag_only || settings.force_free_failure.is_some();
+        let wanted = !site.diag_only
+            || match site.action {
+                Action::ForceRelease => settings.force_free_failure.is_some(),
+                Action::ForceCommit => settings.force_commit_failure.is_some(),
+                _ => false,
+            };
         #[cfg(not(feature = "diag"))]
         let wanted = !site.diag_only;
         if wanted {

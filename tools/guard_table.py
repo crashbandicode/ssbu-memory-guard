@@ -17,6 +17,7 @@ OFFSETS = {
     "REHASH_NEXT": 0x391758C,        # ldr x13, [x9, #0x10]
     "ABORT_STUB": 0x39C2654,         # ldr x17, [x16, #0x208] in abort's import stub
     "FREE_PAGES_FORCE": 0x37CAE1C,   # mov x1, x21 (diag only)
+    "ALLOC_PAGES_FORCE": 0x37CA660,  # mov x1, x19 before bl AllocateMemoryPages (diag only)
     # relied-on windows
     "DISPATCH_LIST_RELIED": 0x38167E8,
     "COMPONENT_GET_RELIED": 0x38100,

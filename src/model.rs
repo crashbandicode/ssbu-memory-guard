@@ -170,6 +170,10 @@ pub enum Action {
     /// Diag only: just before the release call (`mov x1, x21`, with `x0`
     /// already the address); the forced refusal passes address 0 instead.
     ForceRelease,
+    /// Diag only: just before the commit call (`mov x1, x19`, with `x0`
+    /// already the address); the forced refusal passes address 0 instead, so
+    /// the game aborts from `ABORT_AFTER_COMMIT` with the real `x19`/`x21`.
+    ForceCommit,
 }
 
 /// A window of instructions a hook relies on: the first `kept` must be
@@ -229,7 +233,7 @@ const ABORT_RELIED: [Relied; 3] = [
 ];
 
 /// Every site, in install order. Indices are the hook and stub numbers.
-pub const SITES: [Site; 9] = [
+pub const SITES: [Site; 10] = [
     Site {
         name: "dispatch_list",
         offset: 0x381_6814,
@@ -340,6 +344,18 @@ pub const SITES: [Site; 9] = [
         action: Action::ForceRelease,
         diag_only: true,
     },
+    Site {
+        name: "alloc_pages_force",
+        offset: 0x37c_a660,
+        guard: guards::ALLOC_PAGES_FORCE.guard,
+        relied: &[Relied {
+            offset: 0x37c_a654,
+            bytes: guards::ALLOC_PAGES_RELIED,
+            kept: 3,
+        }],
+        action: Action::ForceCommit,
+        diag_only: true,
+    },
 ];
 
 /// The site table index of a name (diag settings name sites).
@@ -409,6 +425,8 @@ pub struct CommitFailure {
     /// `svcGetInfo` 16 (total) and 17 (used); `u64::MAX` when unread.
     pub slab_total: u64,
     pub slab_used: u64,
+    /// Set by the diagnostic build's forced refusal (Eden); the console never sets it.
+    pub forced: bool,
 }
 
 impl CommitFailure {
@@ -420,6 +438,7 @@ impl CommitFailure {
         used: u64::MAX,
         slab_total: u64::MAX,
         slab_used: u64::MAX,
+        forced: false,
     };
 }
 
@@ -440,6 +459,9 @@ pub fn commit_line(out: &mut impl Write, tick: u64, failure: &CommitFailure) -> 
             " slab_total={:#x} slab_used={:#x}",
             failure.slab_total, failure.slab_used
         )?;
+    }
+    if failure.forced {
+        write!(out, " forced=1")?;
     }
     writeln!(out)
 }
@@ -488,6 +510,10 @@ pub struct DiagSettings {
     pub repair_off: bool,
     /// Refuse the release that makes this count (`free_pages_force`).
     pub force_free_failure: Option<u64>,
+    /// Refuse the commit that makes this count (`alloc_pages_force`), counting
+    /// only commits made after `force-commit.now` appears in the data folder,
+    /// so a run can load Training first and then ask for it.
+    pub force_commit_failure: Option<u64>,
 }
 
 impl DiagSettings {
@@ -511,6 +537,9 @@ impl DiagSettings {
                 }
                 b"repair" => out.repair_off = value == b"off",
                 b"force_free_failure" => out.force_free_failure = parse_u64(value),
+                b"force_commit_failure" => {
+                    out.force_commit_failure = parse_u64(value).filter(|n| *n > 0)
+                }
                 _ => {}
             }
         }
@@ -570,6 +599,23 @@ pub fn abort_line(
     } else {
         writeln!(out, "{tick} abort caller={caller:#x}")
     }
+}
+
+/// `<tick> diag inject site=<name> value=<hex> planted=<hex>`: a stray bit the
+/// diagnostic build planted. Not compiled into the release build.
+#[cfg(any(feature = "diag", test))]
+pub fn inject_line(
+    out: &mut impl Write,
+    tick: u64,
+    site: usize,
+    value: u64,
+    planted: u64,
+) -> core::fmt::Result {
+    let name = SITES.get(site).map_or("?", |s| s.name);
+    writeln!(
+        out,
+        "{tick} diag inject site={name} value={value:#x} planted={planted:#x}"
+    )
 }
 
 /// Verdicts as the hooks pass them to the writer thread (one word each).
@@ -738,6 +784,17 @@ mod tests {
         assert_eq!(site_word("rehash_next"), ldr_imm(13, 9, 0x10));
         assert_eq!(site_word("abort_stub"), ldr_imm(17, 16, 0x208));
         assert_eq!(site_word("free_pages_force"), 0xaa15_03e1, "mov x1, x21");
+        assert_eq!(site_word("alloc_pages_force"), 0xaa13_03e1, "mov x1, x19");
+        let commit = by_name("alloc_pages_force").relied[0].stock();
+        assert_eq!(
+            commit[2], 0xaa15_03e0,
+            "mov x0, x21: x0 is the address at the site"
+        );
+        assert_eq!(
+            commit[4] >> 26,
+            0b100101,
+            "bl AllocateMemoryPages right after it"
+        );
     }
 
     #[test]
@@ -824,7 +881,7 @@ mod tests {
             assert_eq!(site_index(site.name.as_bytes()), Some(i));
         }
         assert_eq!(site_index(b"nope"), None);
-        assert_eq!(SITES.iter().filter(|s| s.diag_only).count(), 1);
+        assert_eq!(SITES.iter().filter(|s| s.diag_only).count(), 2);
     }
 
     #[test]
@@ -861,6 +918,14 @@ mod tests {
         assert!(s.repair_off);
         let s = DiagSettings::parse(b" force_free_failure = 40 \r\ninject=list_head:empty:3\n");
         assert_eq!(s.force_free_failure, Some(40));
+        assert_eq!(s.force_commit_failure, None);
+        let s = DiagSettings::parse(b"force_commit_failure=3\n");
+        assert_eq!(s.force_commit_failure, Some(3));
+        assert_eq!(
+            DiagSettings::parse(b"force_commit_failure=0").force_commit_failure,
+            None,
+            "the first commit is 1"
+        );
         assert_eq!(
             s.inject[site_index(b"list_head").unwrap()],
             None,
@@ -990,6 +1055,16 @@ mod tests {
     }
 
     #[test]
+    fn inject_line_text() {
+        let mut t = Text(String::new());
+        inject_line(&mut t, 5, 3, 0x6a_0000_0000, 0x46a_0000_0000).unwrap();
+        assert_eq!(
+            t.0,
+            "5 diag inject site=list_next value=0x6a00000000 planted=0x46a00000000\n"
+        );
+    }
+
+    #[test]
     fn commit_line_text() {
         let failure = CommitFailure {
             result: 0xca01,
@@ -999,6 +1074,7 @@ mod tests {
             used: 0x9c00_0000,
             slab_total: 0x100_0000,
             slab_used: 0xff_f000,
+            forced: false,
         };
         let mut t = Text(String::new());
         commit_line(&mut t, 12, &failure).unwrap();
@@ -1012,13 +1088,14 @@ mod tests {
             13,
             &CommitFailure {
                 result: 0xd001,
+                forced: true,
                 ..CommitFailure::EMPTY
             },
         )
         .unwrap();
         assert_eq!(
             t.0,
-            "13 alloc_pages_refused caller=main+0x37ca68c result=0xd001 (2001-0104) address=0x0 size=0x0\n"
+            "13 alloc_pages_refused caller=main+0x37ca68c result=0xd001 (2001-0104) address=0x0 size=0x0 forced=1\n"
         );
     }
 }
