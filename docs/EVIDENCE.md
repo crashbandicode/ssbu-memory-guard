@@ -104,6 +104,24 @@ plugin.
   plugins (Online Deluxe 0.10.2 among them), which read back unchanged.
   To remove it, delete `libmemory_guard.nro` from the plugins folder.
 
+## Release and card install of 0.2.0, 2026-11-13
+
+**Untested on hardware (Eden-tested only; installed on the card, not yet
+played).**
+
+- Tag `v0.2.0` is on `924caff`, the commit that built the release NRO. A
+  clean clone of it built byte-identical to the Eden-tested release build
+  (`203ffd6f…`, 40,960 bytes). Its 30 host tests passed.
+- Installed on the operator's card over hekate UMS (22:09:04Z,
+  `installed_verified`), with Online Deluxe 0.10.6 and TrainingRooms rc.12.
+  The readback was `203ffd6f…`, and the card's other plugins read back
+  unchanged. The receipt is
+  `smash-training-lobby/artifacts/phase23/card-rc12/1-memory-guard/`.
+- The [Forgejo release](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.2.0)
+  and the GitHub release carry the NRO, `manifest.json` (`441fb200…`,
+  `hardware_tested: false`) and `SHA256SUMS.txt`.
+- It has not been played on the console, so there is no console log of 0.2.0 yet.
+
 ## Eden, 2026-11-13: 0.2.0's refused page commit (the Yoga, mg020)
 
 Two boots on the Yoga, one Eden each.

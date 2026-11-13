@@ -39,10 +39,17 @@ LAN Online match ended with no desync. On the operator's Switch since
 with no repair, refusal or abort logged yet. Details: [docs/EVIDENCE.md](docs/EVIDENCE.md); how it
 works and what it logs: [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
+**0.2.0** also records why the system refused to commit memory pages when
+the game aborts on that (the console hang of 2026-11-13 ended there). It
+is **untested on hardware (Eden-tested only; installed on the card, not
+yet played)**. In Eden on 2026-11-13 a forced refusal was recorded as one
+line, and the release build ran Training cleanly with the card's plugins.
+
 ## Install
 
-[Download 0.1.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.1.0)
-and copy `libmemory_guard.nro` to
+[Download 0.2.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.2.0)
+(untested on hardware; [0.1.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.1.0)
+is the previous release) and copy `libmemory_guard.nro` to
 `sd:/atmosphere/contents/01006A800016E000/romfs/skyline/plugins/`.
 
 ## Build

@@ -1,7 +1,8 @@
 # How it works
 
 2026-11-13, for 0.1.0 (`main` at `fd1b9a6`, the same source as tag `v0.1.0`),
-plus the 0.2.0 commit-side record (not released, not on the card).
+plus the 0.2.0 commit-side record (released as `v0.2.0` on 2026-11-13 and
+installed on the card; untested on hardware, not yet played).
 Moved here from the README; each point names the code it describes.
 
 ## The rule
