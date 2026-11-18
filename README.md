@@ -47,6 +47,8 @@ line, and the release build ran Training cleanly with the card's plugins.
 
 ## Install
 
+Tested on: Super Smash Bros. Ultimate 13.0.5 · Switch firmware 23.5.0 · Atmosphère 1.12.2
+
 [Download 0.2.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.2.0)
 (untested on hardware; [0.1.0](https://git.syntaxbyexample.com/intpa/ssbu-memory-guard/releases/tag/v0.1.0)
 is the previous release) and copy `libmemory_guard.nro` to
